@@ -15,3 +15,6 @@ docker run -u root -it -d --name wyz_dsv4-vision --net=host --privileged=true --
   -v /home/:/home/ -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
   -v /etc/hixlep:/etc/hixlep \
   wyz_dsv4-vision:can920，
+
+
+vllm serve /mnt/share/w00981893/DeepSeek-V4-Flash-Vision-Exp-bf16/   --served-model-name auto   --trust-remote-code   --tensor-parallel-size 1   --pipeline-parallel-size 1   --data-parallel-size 8  --enable-expert-parallel   --max-num-seqs 12   --max-model-len 8192   --gpu-memory-utilization 0.95   --async-scheduling   --mm-processor-cache-gb 0   --kv-cache-dtype bfloat16   --port 20007   --additional-config '{"enable_cpu_binding": true}'   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
