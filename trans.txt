@@ -1,0 +1,4 @@
+trans
+
+vllm：c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+vllm-ascend：be4fb36a959933e47f644c1fe468a2c88b13e98b
