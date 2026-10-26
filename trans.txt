@@ -2,3 +2,16 @@ trans
 
 vllm：c4df37dfcc7f72ca41cd43801a468526ecf99a2b
 vllm-ascend：be4fb36a959933e47f644c1fe468a2c88b13e98b
+
+docker run -u root -it -d --name wyz_dsv4-vision --net=host --privileged=true --ipc=host \
+  --device=/dev/davinci_manager --device=/dev/hisi_hdc --device=/dev/ummu --device=/dev/uburma \
+  --device=/dev/davinci{0..7} \
+  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+  -v /root/host:/root/host -v /lib/route.conf:/lib/route.conf \
+  -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+  -v /usr/local/dcmi:/usr/local/dcmi -v /var/log/npu/:/usr/slog \
+  -v /mnt:/mnt -v /etc/hccn.conf:/etc/hccn.conf \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /home/:/home/ -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /etc/hixlep:/etc/hixlep \
+  wyz_dsv4-vision:can920，
