@@ -18,3 +18,17 @@ docker run -u root -it -d --name wyz_dsv4-vision --net=host --privileged=true --
 
 
 vllm serve /mnt/share/w00981893/DeepSeek-V4-Flash-Vision-Exp-bf16/   --served-model-name auto   --trust-remote-code   --tensor-parallel-size 1   --pipeline-parallel-size 1   --data-parallel-size 8  --enable-expert-parallel   --max-num-seqs 12   --max-model-len 8192   --gpu-memory-utilization 0.95   --async-scheduling   --mm-processor-cache-gb 0   --kv-cache-dtype bfloat16   --port 20007   --additional-config '{"enable_cpu_binding": true}'   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+
+
+einops                                   0.8.2
+numpy                                    1.26.4
+ray                                      2.48.0
+torch                                    2.10.0+cpu
+torch_npu                                2.10.0.post4
+torchaudio                               2.10.0+cpu
+torchvision                              0.25.0+cpu
+transformers                             5.14.1
+triton                                   3.5.0
+triton_ascend                            3.2.2
+vllm                                     0.30.1rc1.dev447+gc4df37dfc.empty      /mnt/share/w00981893/dsv4-vision-vllm/vllm
+vllm_ascend                              0.19.1rc2.dev2909+gbe4fb36a9.d20261021 /mnt/share/w00981893/dsv4-vision-vllm/vllm-ascend
