@@ -94,3 +94,6 @@ model-00045-of-00048.safetensors  e8e39c680c22f49efa115876dfea2000
 model-00046-of-00048.safetensors  dfc471c24fba699caf506d2b1326a881
 model-00047-of-00048.safetensors  bfde517e4232b2a9444a68e999838b95
 model-00048-of-00048.safetensors  b6583961259cd41f98545912133955e3
+
+
+https://github.com/hw-wangbo/moe-small-verify-big/tree/main
