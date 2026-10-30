@@ -97,3 +97,39 @@ model-00048-of-00048.safetensors  b6583961259cd41f98545912133955e3
 
 
 https://github.com/hw-wangbo/moe-small-verify-big/tree/main
+
+一、Processor（processor/，训练/推理共用的多模态入口）
+文件	职责	关键点
+encoding_dsv4.py (957行)	纯文本对话渲染器 + DSML tool-call 编解码 + 输出解析	角色模型与 V3 差异大：无 tool 角色（tool 结果必须 merge 进 user 消息）；图像 block 先替换为 <｜deepseek_image｜> 占位符
+image_processor.py (184行)	像素 → patch/sent 布局	解析式 token 预算求解（max 384 token）；超宽图(≥8:1)直接拉伸；bf16、mean=0.5/std=0.5 归一化（非 VL2 的 0.481/0.269）
+processing_deepseek_v4.py (363行)	HF Processor 封装	预展开（preexpand）协议核心：占位符 token 直接展开成词表尾部 sentinel id 129257–129261（vocab_size=129280+type 0–4），N-layout 布局（4-token 压缩对齐、行尾 NEW_LINE、奇数行补 pad、2 行交错 perm）
+二、主要 Patch（按重要性1. verl/0001-dsv4-vision.patch（23KB，10 个文件）— 训练框架侧核心
+视觉输入重建（model_forward.py）：修复 verl megatron 路径丢失 DSV4 vision keys（grid/perm/types）导致图像 embedding 全零的 bug——按 sentinel run（id≥129257）定位图像块重建 record 喂给 forward
+MoE 权重布局还原（新文件 npu_expert_layout.py）：vLLM rollout 加载后专家被转成推理布局（w13: [E,h,2i]），同步回 trainer 前必须 transpose 还原成 checkpoint 布局（单层 2.1 GiB，刻意零拷贝）
+**Vision Bridge 防误派DSv4-Flash-Vision 与文本版共用 architecture key，强制校验必须用 DeepSeekV4FlashVisionBridge
+processor 直连加载：绕过 transformers remote-code 缓存（会弄丢同级 import），从 DSV4_PROCESSOR_DIR 用 importlib 加载
+占位符折叠：agent_loop 里调 collapse_media_blocks，防止相邻两张图被通用逻辑错合并
+2. vllm-ascend/0001–0004（推理侧，按序叠加）
+
+0001：加载跳过不存在参数（PP/EP 分片时防 KeyError）
+0002：视觉塔 kernel 对齐——把 vLLM 视觉塔的 RoPE/RMSNorm/Attention/SwiGLU 换回与 megatron一致的 CANN 融合算子（npu_rotary_mul/npu_rms_norm/npu_fusion_attention_v3/npu_swiglu），这是 train/rollout 数值对齐的关键
+0003：DSV4_FORCE_MOE_ALLTOALL=1环境变量强制 MoE 走 alltoall dispatch
+0004：识别 verl 预展开的 sentinel prompt，防止 vLLM 二次展开
+3. mindspeed-bridge/0001（82KB，最大）— 训练内核侧
+
+整合上游 master + PR191/187：DSv4 专属 hash 路由（Dsv4HashRouter，查 tid2eid 表）、mHC 双后端（Ascend CANN / Blackwell fused）、MoE 前反向 overlap 适配
+重要细节：vision step 补 stash_input_ids——hash 路由按 token id 查表，不 stash 会静默回退 score 路由且难以察觉
+DSV4_LOG_EXPERT_LOAD=1 可打印每层 per-expert 负载（min/mean/max/std），这个对你做专家热点分析直接有用
+4. 小 patch
+
+transform-engine-npu/0001：M=0 token 的 grouped GEMM 防 crash（空 batch 直接返回）
+megatron-lm/0001：nvrx 异步 checkpoint 版本探测从 assert 改为优雅跳过（NPU 环境没有 nvrx）
+processor/0001（可选）：processor 随 checkpoint 序列化，当前未启用
+三、配合关系（一张图）
+verl patch（喂数据/还原权重布局） ←→ vllm-ascend 0001/0004（收数据/跳过缺失）
+verl _build_dsv4_images_from_mm ←→ mindspeed-bridge vision step（消费 images kwarg）
+vllm-ascend 0002（rollout 视觉 kernel）←→ megatron 参考实现（trainer 侧sentinel 协议 129257-129261：processor 展开 = vllm-ascend 0004 识别 = agent_loop 折叠，三处必须一致
+四、两个值得注意的点
+版本错位：这个包 pin 的是 vLLM v0.30.0 + vLLM-Ascend rc2、Megatron-Bridge v0.5.0（不打 patch），且 README 明确说 transformers 5.10 兼容性未解决（bridge 上游约束 <5.9）。而你之前查的 c4df37df（vllm 主分支 9-）和 be4fb36a（ascend 主分支 10-19）都是更新的 main commit，和这个包不是同一套基线——对照分析时别混用。
+与你前面 eval 问题的潜在关联：README 说这些 patch 只在容器 dsv4-vision-a3opp-free-0947 上验证过 PPO step 1/2，没有做过数值对齐验证；patch 自述"不证明每个 patch 都"。如果剪枝模型（top16-pruned-train16）是在这套链路上训的，rollout 端 kernel 未对齐（0002 没打）或权重布局还原有 bug，都会产生你看到的输出退化——建议用 DSV4_LOG_EXPERT_LOAD=1 先确认剪后路由分布是否正常。
+
