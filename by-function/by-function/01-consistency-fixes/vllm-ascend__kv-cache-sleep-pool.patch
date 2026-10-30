@@ -1,0 +1,115 @@
+# ============================================================================
+# patch : vllm-ascend__kv-cache-sleep-pool.patch
+# 功能  : sleep 模式下将 kv_cache 内存池限定在 cache 分配内（kv_cache_allocation_context 下穿 worker→model_runner），避免持久元数据被 sleep/wake 丢弃
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__kv-cache-sleep-pool.patch
+# 对应旧编号: 无
+# 前置依赖: 本 patch 中 model_runner_v1.py 部分须先于 04 组 vllm-ascend__rand-dummy-inputs.patch 应用（同文件链）
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index dfff01429..7b5804c64 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -21,6 +21,7 @@ import copy
+ import gc
+ import inspect
+ import logging
++from contextlib import AbstractContextManager, nullcontext
+ from types import NoneType
+ from typing import Any
+ 
+@@ -1136,19 +1137,33 @@ class NPUWorker(WorkerBase):
+         if self.model_runner is not None:
+             self.model_runner.update_max_model_len(max_model_len)
+         logger.debug("Updated max_model_len to %s", max_model_len)
++    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
++        """Return the sleep-mode pool for ``tag``, or a no-op context."""
++    #def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
++        #"""Allocate NPU KV cache with the specified kv_cache_config."""
++        #ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
++        if self.vllm_config.model_config.enable_sleep_mode:
++            allocator = CaMemAllocator.get_instance()
++            #context = allocator.use_memory_pool(tag="kv_cache")
++        #else:
++            #from contextlib import nullcontext
++            return allocator.use_memory_pool(tag=tag)
++        return nullcontext()
++
++            #context = nullcontext()  # type: ignore
++        #with context:
++            #self.model_runner.initialize_kv_cache(kv_cache_config)
+ 
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate NPU KV cache with the specified kv_cache_config."""
+         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+-        if self.vllm_config.model_config.enable_sleep_mode:
+-            allocator = CaMemAllocator.get_instance()
+-            context = allocator.use_memory_pool(tag="kv_cache")
+-        else:
+-            from contextlib import nullcontext
+-
+-            context = nullcontext()  # type: ignore
+-        with context:
+-            self.model_runner.initialize_kv_cache(kv_cache_config)
++        # Restrict the discardable kv_cache pool to backing cache allocations.
++        # Persistent metadata created during initialize_kv_cache must stay
++        # outside this pool so sleep/wake does not drop its contents.
++        self.model_runner.initialize_kv_cache(
++            kv_cache_config,
++            kv_cache_allocation_context=self._maybe_get_memory_pool_context(tag="kv_cache"),
++        )
+ 
+         # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
+         # set, so its worker-side consumer must use the same condition. Keep the
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -23,7 +23,8 @@
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Callable
+-from contextlib import contextmanager, nullcontext
++#from contextlib import contextmanager, nullcontext
++from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from copy import copy, deepcopy
+ from dataclasses import dataclass, replace
+ from functools import partial
+@@ -4220,7 +4221,7 @@
+ 
+         self.debugger.step(**kwargs)
+ 
+-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
++    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None) -> None:
+         """
+         Initialize KV cache based on `kv_cache_config`.
+         Args:
+@@ -4248,7 +4249,7 @@
+                 kv_cache_config,
+                 self.sparse_kv_offload_config,
+             )
+-        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
++        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context,)
+         # TODO: refactor the logic of attention
+         if (
+             self.speculative_config
+@@ -4307,7 +4308,7 @@
+         offset = (aligned_addr - data_ptr) // tensor.element_size()
+         return tensor[int(offset) :]
+ 
+-    def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
++    def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None,) -> dict[str, torch.Tensor]:
+         """
+         Initialize the memory buffer for KV cache.
+ 
+@@ -4318,7 +4319,9 @@
+             corresponding memory buffer for KV cache.
+         """
+         # Initialize the memory buffer for KV cache
+-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
++        allocation_context = kv_cache_allocation_context or nullcontext()
++        with allocation_context:
++            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+         # Change the memory buffer to the desired shape
+         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+ 

@@ -1,0 +1,42 @@
+# ============================================================================
+# patch : TransformerEngineNPU__m0-guard.patch
+# 功能  : [DSV4_M0_GUARD] general_grouped_gemm / general_grouped_gemm_add_ 在 M=0（零 token）时短路返回正确形状空/零输出，规避 aclnnGroupedMatmulV5 aivec 非法 GM 故障
+# 仓库  : /workspace/TransformerEngineNPU
+# 应用  : cd /workspace/TransformerEngineNPU && patch -p1 < TransformerEngineNPU__m0-guard.patch
+# 对应旧编号: 0003
+# 备注  : 无
+# ============================================================================
+diff --git a/transformer_engine/pytorch/ops/gemm.py b/transformer_engine/pytorch/ops/gemm.py
+index 88c3dd4..cfd9920 100644
+--- a/transformer_engine/pytorch/ops/gemm.py
++++ b/transformer_engine/pytorch/ops/gemm.py
+@@ -322,6 +322,18 @@ def general_grouped_gemm(
+             out = _process_debug_gemm_output(out, quantization_params)
+         return out
+ 
++    # [DSV4_M0_GUARD] aclnnGroupedMatmulV5 faults (aivec invalid GM in its
++    # internal Transpose kernel) when the token dim M is 0 and weights are
++    # non-contiguous views; return the correctly-shaped empty/zero output
++    # without launching the op.
++    if isinstance(A, torch.Tensor) and A.numel() == 0:
++        if group_type == 2:
++            return torch.zeros(
++                (len(group_split), A.shape[0], B[0].shape[-1]),
++                dtype=out_dtype, device=A.device,
++            )
++        return torch.zeros((0, B[0].shape[-1]), dtype=out_dtype, device=A.device)
++
+     if len(B) == 1 and B[0].dim() == 2 and group_type == 0:
+         # num_gemms == 1 (single split-M group, e.g. 1 local expert per EP
+         # domain in KIMI3): the NPU grouped-matmul kernel requires the single
+@@ -466,6 +478,10 @@ def general_grouped_gemm_add_(
+     group_split = _align_group_list_device(group_split, a_data.device)
+     g_size = len(group_split)
+ 
++    # [DSV4_M0_GUARD] zero tokens => zero wgrad contribution; skip the op.
++    if a_data.numel() == 0 or b_data.numel() == 0:
++        return None
++
+     if not is_low_precision:
+         # general_grouped_gemm is declared as (B, A, ...). The wgrad caller
+         # passes (saved_input, grad_output), and this helper receives the same

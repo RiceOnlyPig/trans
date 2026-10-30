@@ -1,0 +1,75 @@
+# ============================================================================
+# patch : vllm-ascend__dbg-mm-io-emb-probes.patch
+# 功能  : vl_model.py：/tmp/dsv4_ioidump 触发 [DBG_IO]/[DBG_EMB]，dump vit/llm grid、input_ids 与融合后 inputs_embeds（每进程一次）
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__dbg-mm-io-emb-probes.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/models/deepseek_v4/vl_model.py b/vllm_ascend/models/deepseek_v4/vl_model.py
+index b9844dd51..a47d3d147 100644
+--- a/vllm_ascend/models/deepseek_v4/vl_model.py
++++ b/vllm_ascend/models/deepseek_v4/vl_model.py
+@@ -134,6 +134,19 @@ class AscendDeepseekV4ForConditionalGeneration(
+         perm: torch.Tensor,
+     ) -> tuple[torch.Tensor, ...]:
+         assert self.vision is not None and self.aligner is not None
++        import os as _os
++        if _os.path.exists("/tmp/dsv4_ioidump") and patches.shape[0] < 5000:
++            try:
++                _d = "/mnt/share/w50065784/kimi-agent/ioidump"
++                _os.makedirs(_d, exist_ok=True)
++                _f = f"{_d}/vllm_mm_{_os.getpid()}.pt"
++                if not _os.path.exists(_f):
++                    torch.save({"vit_grid": vit_grid.detach().cpu(),
++                                "llm_grid": llm_grid.detach().cpu(),
++                                "patches_shape": list(patches.shape)}, _f)
++                    print(f"[DBG_IO] wrote {_f}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_IO] failed {_e!r}", flush=True)
+         patches = patches.to(self.aligner.w1.weight.dtype)
+ 
+         embeds: list[torch.Tensor] = []
+@@ -178,6 +191,17 @@ class AscendDeepseekV4ForConditionalGeneration(
+         from vllm.model_executor.models.utils import (
+             _merge_multimodal_embeddings,
+         )
++        import os as _os
++        if _os.path.exists("/tmp/dsv4_ioidump") and input_ids.numel() > 50 and bool((input_ids >= 129257).any()):
++            try:
++                _d = "/mnt/share/w50065784/kimi-agent/ioidump"
++                _os.makedirs(_d, exist_ok=True)
++                _f = f"{_d}/vllm_{_os.getpid()}.pt"
++                if not _os.path.exists(_f):
++                    torch.save({"input_ids": input_ids.detach().cpu()}, _f)
++                    print(f"[DBG_IO] wrote {_f} n={input_ids.numel()}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_IO] failed {_e!r}", flush=True)
+ 
+         inputs_embeds = self.language_model.embed_input_ids(input_ids)
+         if self.image_start is not None:
+@@ -200,11 +224,23 @@ class AscendDeepseekV4ForConditionalGeneration(
+             return inputs_embeds
+         if is_multimodal is None:
+             raise ValueError("is_multimodal is required when merging image embeddings.")
+-        return _merge_multimodal_embeddings(
++        _mm_out = _merge_multimodal_embeddings(
+             inputs_embeds=inputs_embeds,
+             multimodal_embeddings=multimodal_embeddings,
+             is_multimodal=is_multimodal,
+         )
++        if _os.path.exists("/tmp/dsv4_ioidump") and bool((input_ids >= 129257).any()):
++            try:
++                _d = "/mnt/share/w50065784/kimi-agent/ioidump"
++                _os.makedirs(_d, exist_ok=True)
++                _f = f"{_d}/emb_vllm_{_os.getpid()}.pt"
++                if not _os.path.exists(_f):
++                    torch.save({"input_ids": input_ids.detach().cpu(),
++                                "inputs_embeds": _mm_out.detach().cpu()}, _f)
++                    print(f"[DBG_EMB] wrote {_f}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_EMB] failed {_e!r}", flush=True)
++        return _mm_out
+ 
+     def forward(
+         self,

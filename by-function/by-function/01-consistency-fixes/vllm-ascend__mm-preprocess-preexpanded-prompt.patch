@@ -1,0 +1,98 @@
+# ============================================================================
+# patch : vllm-ascend__mm-preprocess-preexpanded-prompt.patch
+# 功能  : mm_preprocess：支持 verl continuous-token 已预展开（sentinel block 直接入 prompt）的图像占位符识别（_split_image_sentinel_blocks）
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__mm-preprocess-preexpanded-prompt.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/models/deepseek_v4/mm_preprocess.py b/vllm_ascend/models/deepseek_v4/mm_preprocess.py
+index 84da0a16f..4de180d32 100644
+--- a/vllm_ascend/models/deepseek_v4/mm_preprocess.py
++++ b/vllm_ascend/models/deepseek_v4/mm_preprocess.py
+@@ -235,6 +235,43 @@ def build_image_block_pad_free(n_llm_h: int, n_llm_w: int):
+     position is known.
+     """
+     return build_image_block(n_llm_h, n_llm_w, COMPRESS_PAD_TO - 1)
++def _split_image_sentinel_blocks(token_ids: Sequence[int]) -> "list[tuple[int, int]]":
++    """Split maximal runs of in-vocab image sentinel ids into per-image blocks.
++
++    Each block is ``[IMAGE_PAD * compress_pad, IMAGE_START, <N-layout
++    interleave>, IMAGE_PAD * pad_last, IMAGE_END]`` (see ``build_image_block``).
++    Blocks often abut without text in between, so runs are split on the block
++    structure (leading pads -> IMAGE_START -> ... -> IMAGE_END), not on run
++    boundaries alone.
++    """
++    lo = IMAGE_SENTINEL_BASE_ID
++    hi = IMAGE_SENTINEL_BASE_ID + len(IMAGE_SENTINEL_TOKEN_NAMES)
++    start_id = IMAGE_SENTINEL_BASE_ID + IMAGE_START
++    pad_id = IMAGE_SENTINEL_BASE_ID + IMAGE_PAD
++    end_id = IMAGE_SENTINEL_BASE_ID + IMAGE_END
++
++    blocks: "list[tuple[int, int]]" = []
++    i, n = 0, len(token_ids)
++    while i < n:
++        if not (lo <= token_ids[i] < hi):
++            i += 1
++            continue
++        block_start = i
++        while i < n and token_ids[i] == pad_id:
++            i += 1
++        if i >= n or token_ids[i] != start_id:
++            i = block_start + 1
++            continue
++        end = i
++        while end < n and token_ids[end] != end_id:
++            end += 1
++        if end >= n:
++            i = block_start + 1
++            continue
++        blocks.append((block_start, end + 1))
++        i = end + 1
++    return blocks
++
+ 
+ 
+ class DeepseekV4VLImageProcessor:
+@@ -487,6 +524,41 @@ class DeepseekV4VLMultiModalProcessor(BaseMultiModalProcessor[DeepseekV4VLProces
+         first use its supported base implementation, then prepend each image
+         block's compressor-alignment padding and rebuild placeholder offsets.
+         """
++
++        image_updates = mm_prompt_updates.get("image", [])
++        if image_updates:
++            # verl continuous-token prompts can arrive already expanded: the
++            # image placeholder is replaced by the full sentinel block ahead of
++            # time (verl processing_deepseek_v4.py IMAGE_SENTINEL_BASE_ID), so
++            # there is no placeholder token left to replace. Build the
++            # placeholders directly from the in-vocab sentinel runs; every
++            # sentinel embedding is overwritten by the model before decoding.
++            placeholder_id = self.info.get_image_placeholder_token_id()
++            if placeholder_id not in token_ids:
++                validate_image_sentinel_ids(self.info.get_tokenizer())
++                image_embed_id = IMAGE_SENTINEL_BASE_ID + IMAGE
++                blocks = _split_image_sentinel_blocks(token_ids)
++                if len(blocks) != len(image_updates):
++                    raise ValueError(
++                        "DeepSeek-V4 pre-expanded prompt: found "
++                        f"{len(blocks)} image sentinel blocks but "
++                        f"{len(image_updates)} images were provided."
++                    )
++                return token_ids, {
++                    "image": [
++                        PlaceholderFeaturesInfo(
++                            modality="image",
++                            item_idx=item_idx,
++                            start_idx=start,
++                            tokens=token_ids[start:end],
++                            is_embed=torch.tensor(
++                                [t == image_embed_id for t in token_ids[start:end]],
++                                dtype=torch.bool,
++                            ),
++                        )
++                        for item_idx, (start, end) in enumerate(blocks)
++                    ]
++                }
+         new_token_ids, base_placeholders = super()._apply_prompt_updates(
+             token_ids,
+             mm_prompt_updates,

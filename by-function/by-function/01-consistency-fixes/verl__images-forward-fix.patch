@@ -1,0 +1,92 @@
+# ============================================================================
+# patch : verl__images-forward-fix.patch
+# 功能  : Megatron 前向重建 DSV4 images 记录（_build_dsv4_images_from_mm），修复图像块 embedding 为 0 的训推不一致
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__images-forward-fix.patch
+# 对应旧编号: 0002
+# 备注  : 无
+# ============================================================================
+diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
+index 6d2a6b29..a4d8ce62 100644
+--- a/verl/models/mcore/model_forward.py
++++ b/verl/models/mcore/model_forward.py
+@@ -261,6 +261,59 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
+     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
+ 
+ 
++_DSV4_IMAGE_SENTINEL_BASE = 129257
++
++
++def _build_dsv4_images_from_mm(multi_modal_inputs, ids):
++    """Rebuild DeepSeek-V4 ``images`` records for DeepSeekV4FlashVisionModel.forward.
++
++    verl's megatron path drops the DSV4 vision keys (patches/vit_grid/llm_grid/
++    perm/types) from multi_modal_inputs, so the model never encodes images and
++    the image-block embeddings stay zero. Reconstruct per-image records here:
++    block starts are located from contiguous sentinel-id runs (>=129257) in the
++    (possibly thd-packed) token ids; image order follows batch-row order.
++    """
++    patches = multi_modal_inputs["patches"]
++    vit_grid = multi_modal_inputs["vit_grid"]
++    llm_grid = multi_modal_inputs["llm_grid"]
++    perm = multi_modal_inputs["perm"]
++    types = multi_modal_inputs["types"]
++    if ids.dim() == 1:
++        ids = ids.unsqueeze(0)
++    dev = ids.device
++    images = [[] for _ in range(ids.shape[0])]
++    pi = ti = ai = 0
++    img_idx = 0
++    for b in range(ids.shape[0]):
++        sent_pos = (ids[b] >= _DSV4_IMAGE_SENTINEL_BASE).nonzero().flatten().tolist()
++        runs = []
++        for p in sent_pos:
++            if runs and p == runs[-1][1]:
++                runs[-1][1] = p + 1
++            else:
++                runs.append([p, p + 1])
++        for s, e in runs:
++            if img_idx >= len(vit_grid) or e - s < 8:
++                continue  # stray sentinel-like ids sampled into the response
++            h, w = (int(x) for x in vit_grid[img_idx])
++            lh, lw = (int(x) for x in llm_grid[img_idx])
++            n_patches, n_perm = h * w, lh * lw
++            block_len = e - s
++            images[b].append({
++                "start": s,
++                "patches": patches[pi:pi + n_patches].to(dev),
++                "n_vit_h": h,
++                "n_vit_w": w,
++                "types": types[ti:ti + block_len].to(dev),
++                "perm": perm[ai:ai + n_perm].to(dev),
++            })
++            pi += n_patches
++            ti += block_len
++            ai += n_perm
++            img_idx += 1
++    return images
++
++
+ def gptmodel_forward_model_engine(
+     model,
+     input_ids,
+@@ -352,6 +405,8 @@ def gptmodel_forward_model_engine(
+         if router_padding_mask is not None:
+             model_kwargs["padding_mask"] = router_padding_mask
+ 
++        if isinstance(multi_modal_inputs, dict) and multi_modal_inputs.get("patches") is not None:
++            model_kwargs["images"] = _build_dsv4_images_from_mm(multi_modal_inputs, input_ids_rmpad)
+         output_orig = model(
+             input_ids=input_ids_rmpad,
+             attention_mask=attention_mask,
+@@ -449,7 +504,9 @@ def gptmodel_forward_model_engine(
+             )
+         else:
+             attention_mask = attention_mask_bshd
+-
++        # print(attention_mask)
++        if isinstance(multi_modal_inputs, dict) and multi_modal_inputs.get("patches") is not None:
++            model_kwargs["images"] = _build_dsv4_images_from_mm(multi_modal_inputs, input_ids_bshd)
+         output_orig = model(
+             input_ids=input_ids_bshd,
+             attention_mask=attention_mask,

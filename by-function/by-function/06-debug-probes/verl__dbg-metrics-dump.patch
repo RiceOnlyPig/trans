@@ -1,0 +1,38 @@
+# ============================================================================
+# patch : verl__dbg-metrics-dump.patch
+# 功能  : metrics.py calculate_debug_metrics：一次性 dump rollout/actor 数据到 dbg_step1.pt（文件已存在则跳过）
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__dbg-metrics-dump.patch
+# 对应旧编号: 无
+# 备注  : 侦察规范中 metrics.py 同时列于 01 组文件清单；其唯一 hunk 为本调试 dump，故归 06
+# ============================================================================
+diff --git a/verl/utils/debug/metrics.py b/verl/utils/debug/metrics.py
+index 706a7f97..0a96a2f5 100644
+--- a/verl/utils/debug/metrics.py
++++ b/verl/utils/debug/metrics.py
+@@ -61,6 +61,25 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor,
+ 
+ 
+ def calculate_debug_metrics(data: DataProto) -> dict:
++    try:
++        import os as _os
++        _out = "/mnt/share/w50065784/kimi-agent/rollout_debug/dbg_step1.pt"
++        if not _os.path.exists(_out):
++            _os.makedirs(_os.path.dirname(_out), exist_ok=True)
++            _d = {}
++            for _k in ("input_ids", "prompts", "responses", "attention_mask", "position_ids",
++                       "response_mask", "rollout_log_probs", "old_log_probs"):
++                if _k in data.batch.keys():
++                    _d[_k] = data.batch[_k].detach().cpu()
++            for _k, _v in data.non_tensor_batch.items():
++                try:
++                    _d["NT:" + _k] = _v
++                except Exception:
++                    pass
++            torch.save(_d, _out)
++            print(f"DEBUG_DUMP_SAVED {_out} keys={list(_d.keys())}")
++    except Exception as _e:
++        print(f"DEBUG_DUMP_FAILED: {_e!r}")
+     """
+     calculate rollout vs actor logprobs diff, for debugging purpose
+ 

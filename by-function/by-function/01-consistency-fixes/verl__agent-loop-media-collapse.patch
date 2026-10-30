@@ -1,0 +1,67 @@
+# ============================================================================
+# patch : verl__agent-loop-media-collapse.patch
+# 功能  : agent_loop：使用 processor.collapse_media_blocks 折叠媒体占位符并做 decode→encode 往返校验，保留相邻多图语义
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__agent-loop-media-collapse.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 52ccad98..22e22208 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -854,16 +854,44 @@ class AgentLoopWorker:
+         # processor triggers a double-expansion error. Collapsing at the token-id
+         # level (using the processor-resolved placeholder ids) is model-agnostic
+         # and leaves the well-behaved (special-token) placeholders untouched.
+-        image_token_id = get_processor_token_id(self.processor, "image")
+-        video_token_id = get_processor_token_id(self.processor, "video")
+-        collapse_ids = {t for t in (image_token_id, video_token_id) if t is not None}
+-        collapsed_ids, prev_id = [], None
+-        for token_id in input_ids.squeeze(0).tolist():
+-            if token_id in collapse_ids and token_id == prev_id:
+-                continue
+-            collapsed_ids.append(token_id)
+-            prev_id = token_id
+-        current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
++        flat_ids = input_ids.squeeze(0).tolist() if input_ids.dim() > 1 else input_ids.tolist()
++        collapse_media_blocks = getattr(self.processor, "collapse_media_blocks", None)
++        if callable(collapse_media_blocks):
++            collapsed_ids = collapse_media_blocks(flat_ids)
++            # 该模型的占位符折叠已经自带"每个 media 变一个 token"的语义；
++            # 绝不能再跑通用"去掉相邻重复占位符"逻辑，否则 [129264, 129264]
++            # 这种相邻两张图会被错误合并成一张。
++            current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
++
++            # 立刻校验：占位符在 decode→encode 往返后必须仍然存在。
++            # 若 129264 是 special token（被 skip_special_tokens 剥掉），
++            # 或者不在词表，会在这里第一时间暴露而不是等 processor 里报错。
++            image_token_id = get_processor_token_id(self.processor, "image")
++            if images and image_token_id is not None:
++                n_ph = sum(
++                    1 for t in self.tokenizer.encode(current_text, add_special_tokens=False)
++                    if t == image_token_id
++                )
++                if n_ph != len(images):
++                    raise RuntimeError(
++                        f"collapse_media_blocks produced text without a surviving image "
++                        f"placeholder: image_token_id={image_token_id} "
++                        f"(is_special={image_token_id in getattr(self.tokenizer, 'all_special_ids', [])}), "
++                        f"found {n_ph} placeholders for {len(images)} images. "
++                        f"Fix: IMAGE_TOKEN_ID must be a NON-special in-vocab id. "
++                        f"text head={current_text[:200]!r}"
++                    )
++        else:
++            image_token_id = get_processor_token_id(self.processor, "image")
++            video_token_id = get_processor_token_id(self.processor, "video")
++            collapse_ids = {t for t in (image_token_id, video_token_id) if t is not None}
++            collapsed_ids, prev_id = [], None
++            for token_id in input_ids.squeeze(0).tolist():
++                if token_id in collapse_ids and token_id == prev_id:
++                    continue
++                collapsed_ids.append(token_id)
++                prev_id = token_id
++            current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
+ 
+         multi_modal_inputs = build_multimodal_processor_inputs(
+             self.processor,

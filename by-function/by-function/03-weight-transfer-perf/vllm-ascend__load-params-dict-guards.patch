@@ -1,0 +1,57 @@
+# ============================================================================
+# patch : vllm-ascend__load-params-dict-guards.patch
+# 功能  : model.py load_weights：四处 params_dict 缺失名直接 continue（sink/mlp/expert/默认分支），避免在线权重更新时 KeyError；仅含功能性 hunk
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__load-params-dict-guards.patch
+# 对应旧编号: 无
+# 前置依赖: 与同文件 06 组 vllm-ascend__dbg-load-map-zero-bias.patch 为链式：本 patch 须先应用
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -1209,6 +1209,8 @@
+             if "sink" in name:
+                 if is_pp_missing_parameter(name, self):
+                     continue
++                if name not in params_dict:
++                    continue
+                 param = params_dict[name]
+                 if enable_dsa_cp():
+                     param.data.copy_(loaded_weight)
+@@ -1250,7 +1252,8 @@
+ 
+                 if is_pp_missing_parameter(name, self):
+                     continue
+-
++                if name not in params_dict:
++                    continue
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
+@@ -1313,12 +1316,14 @@
+ 
+                         if is_pp_missing_parameter(name_mapped, self):
+                             continue
+-
++                        if name_mapped not in params_dict:
++                            continue
+                         param = params_dict[name_mapped]
+                         # We should ask the weight loader to return success or
+                         # not here since otherwise we may skip experts with
+                         # other available replicas.
+                         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++
+                         success = weight_loader(
+                             param,
+                             weight_to_load,
+@@ -1351,7 +1356,8 @@
+ 
+                         if is_pp_missing_parameter(name, self):
+                             continue
+-
++                        if name not in params_dict:
++                            continue
+                         param = params_dict[name]
+                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                         weight_loader(param, loaded_weight)

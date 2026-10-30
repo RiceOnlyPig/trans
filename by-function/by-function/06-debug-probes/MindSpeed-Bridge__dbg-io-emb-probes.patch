@@ -1,0 +1,64 @@
+# ============================================================================
+# patch : MindSpeed-Bridge__dbg-io-emb-probes.patch
+# 功能  : deepseek_v4_flash_vision_model.py [DBG_EMB] 与 forward_step.py [DBG_IO]：/tmp/dsv4_ioidump 触发 dump decoder_input/前向输入（每 rank 一次）
+# 仓库  : /workspace/MindSpeed-Bridge
+# 应用  : cd /workspace/MindSpeed-Bridge && patch -p1 < MindSpeed-Bridge__dbg-io-emb-probes.patch
+# 对应旧编号: 相关 0007（旧 ltrace 版本）
+# 备注  : 无
+# ============================================================================
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash_vision/deepseek_v4_flash_vision_model.py b/mindspeed_bridge/models/deepseek_v4_flash_vision/deepseek_v4_flash_vision_model.py
+index c22ec3c..ba9af8b 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash_vision/deepseek_v4_flash_vision_model.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash_vision/deepseek_v4_flash_vision_model.py
+@@ -416,6 +416,20 @@ class DeepSeekV4FlashVisionModel(MegatronModule):
+                         start = int(img["start"])
+                         h[i, start : start + block.size(0)] = block
+                 decoder_input = h.transpose(0, 1).contiguous()
++                import os as _os
++                if _os.path.exists("/tmp/dsv4_ioidump"):
++                    try:
++                        import torch.distributed as _dist
++                        _r = _dist.get_rank() if _dist.is_initialized() else 0
++                        _d = "/mnt/share/w50065784/kimi-agent/ioidump"
++                        _os.makedirs(_d, exist_ok=True)
++                        _f = f"{_d}/emb_meg_rank{_r}.pt"
++                        if not _os.path.exists(_f):
++                            torch.save({"input_ids": input_ids.detach().cpu(),
++                                        "decoder_input": decoder_input.detach().cpu()}, _f)
++                            print(f"[DBG_EMB] wrote {_f}", flush=True)
++                    except Exception as _e:
++                        print(f"[DBG_EMB] failed {_e!r}", flush=True)
+ 
+             if self.config.sequence_parallel:
+                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash_vision/forward_step.py b/mindspeed_bridge/models/deepseek_v4_flash_vision/forward_step.py
+index 5aa6055..c634830 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash_vision/forward_step.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash_vision/forward_step.py
+@@ -151,6 +151,26 @@ def forward_step(
+             images, cp_rank, cp_size, int(getattr(config, "seq_length", tokens.size(1) * cp_size))
+         )
+ 
++    import os as _os
++    if _os.path.exists("/tmp/dsv4_ioidump"):
++        try:
++            import torch.distributed as _dist
++            _r = _dist.get_rank() if _dist.is_initialized() else 0
++            _out = f"/mnt/share/w50065784/kimi-agent/ioidump/meg_rank{_r}.pt"
++            if not _os.path.exists(_out):
++                _os.makedirs(_os.path.dirname(_out), exist_ok=True)
++                _meta = []
++                if images is not None:
++                    for _imgs in images:
++                        for _img in _imgs:
++                            _meta.append({_k: (_v.cpu() if hasattr(_v, "cpu") else _v)
++                                          for _k, _v in _img.items() if _k != "patches"})
++                torch.save({"input_ids": tokens.cpu(),
++                            "position_ids": position_ids.cpu() if position_ids is not None else None,
++                            "img_meta": _meta}, _out)
++                print(f"[DBG_IO] wrote {_out}", flush=True)
++        except Exception as _e:
++            print(f"[DBG_IO] failed {_e!r}", flush=True)
+     forward_args = {
+         "input_ids": tokens,
+         "labels": labels,

@@ -1,0 +1,21 @@
+# ============================================================================
+# patch : MindSpeed-Bridge__csa-smla-fused-guard.patch
+# 功能  : csa.py：_is_hca_layer 在 _CSA_SMLA_FUSED 关闭时直接返回 False（fused 路径总开关）
+# 仓库  : /workspace/MindSpeed-Bridge
+# 应用  : cd /workspace/MindSpeed-Bridge && patch -p1 < MindSpeed-Bridge__csa-smla-fused-guard.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/csa.py b/mindspeed_bridge/models/deepseek_v4_flash/csa.py
+index ea9677b..add6d7c 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/csa.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/csa.py
+@@ -487,6 +487,8 @@ def _is_hca_layer(sq: int, n_kv: int, topk_width: int, ori_len: int | None = Non
+     and the topk width are measured against it. Prefix mode has no pad arm
+     (that one is 128-grid specific), so off-grid lengths fall back to bmm.
+     """
++    if not _CSA_SMLA_FUSED:
++        return False
+     ori = sq if ori_len is None else ori_len
+     if topk_width != 128 + (n_kv - ori):
+         return False

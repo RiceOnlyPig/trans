@@ -1,0 +1,28 @@
+# ============================================================================
+# patch : vllm-ascend__force-moe-alltoall.patch
+# 功能  : DSV4_FORCE_MOE_ALLTOALL=1 强制 MoE 通信走 ALLTOALL，绕开 MC2（MoeDistributeCombineV2 vector core 超时）
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__force-moe-alltoall.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+index 811ddc5ff..36f11affa 100644
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -1,4 +1,5 @@
+ import math
++import os
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from enum import Enum
+@@ -353,6 +354,9 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
+     if not is_moe_model(vllm_config):
+         return None
+ 
++    if os.environ.get("DSV4_FORCE_MOE_ALLTOALL") == "1":
++        return MoECommType.ALLTOALL
++
+     mc2_tokens_capacity = get_mc2_tokens_capacity()
+     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
+     lora_config = getattr(vllm_config, "lora_config", None)

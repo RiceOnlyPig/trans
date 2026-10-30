@@ -1,0 +1,34 @@
+# ============================================================================
+# patch : MindSpeed-Bridge__debug-leftovers.patch
+# 功能  : csa_fused.py 遗留 print("[is_paded]", q_in)；hybrid_attention.py 注释掉的 ROPE-CHECK 实验代码
+# 仓库  : /workspace/MindSpeed-Bridge
+# 应用  : cd /workspace/MindSpeed-Bridge && patch -p1 < MindSpeed-Bridge__debug-leftovers.patch
+# 对应旧编号: 无
+# 备注  : 遗留调试代码，建议不合入主线（csa_fused 的 print 每次调用都会输出）
+# ============================================================================
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/csa_fused.py b/mindspeed_bridge/models/deepseek_v4_flash/csa_fused.py
+index 6303c3f..872d0b6 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/csa_fused.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/csa_fused.py
+@@ -121,6 +121,7 @@ class _SmlaHcaFunction(torch.autograd.Function):
+                     n_cmp_p - n_cmp, b, hn, dtype=kv_full.dtype, device=kv_full.device
+                 )
+                 cmp_full = torch.cat([cmp_full, zeros], dim=0)
++            print("[is_paded]", q_in)
+         else:
+             q_in = query
+             ori_full = kv_full[:ori]
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/modelling_dsv4_hybrid/deepseek_v4_hybrid_attention.py b/mindspeed_bridge/models/deepseek_v4_flash/modelling_dsv4_hybrid/deepseek_v4_hybrid_attention.py
+index c91b68d..446b12e 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/modelling_dsv4_hybrid/deepseek_v4_hybrid_attention.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/modelling_dsv4_hybrid/deepseek_v4_hybrid_attention.py
+@@ -627,6 +627,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
+         cp_size = self.pg_collection.cp.size()
+         cp_rank = self.pg_collection.cp.rank()
+         local_seq_len = hidden_states.size(0)
++        # print("[ROPE-CHECK] apply_rope_fusion =", self.config.apply_rope_fusion)
++        # if self.config.apply_rope_fusion:
++        #     self.config.apply_rope_fusion = False
+         if self.config.apply_rope_fusion:
+             # ``mscale=1.0`` strips yarn's concentration factor from the
+             # cached cos/sin so the fused kernel matches the unfused

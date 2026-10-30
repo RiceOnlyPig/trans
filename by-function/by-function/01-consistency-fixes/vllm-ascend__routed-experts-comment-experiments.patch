@@ -1,0 +1,209 @@
+# ============================================================================
+# patch : vllm-ascend__routed-experts-comment-experiments.patch
+# 功能  : ops/fused_moe/routed_experts.py：全部为注释掉的 [fix -modify]/[fix -debug] 实验代码与空行，无行为变化
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__routed-experts-comment-experiments.patch
+# 对应旧编号: 无
+# 备注  : 未拆分，整文件 diff；注释形态实验代码，建议不合入主线
+# ============================================================================
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index 30f0c4d71..a1ac8e707 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -98,6 +98,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+     def process_weights_after_loading(self, layer):
+         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
+ 
++        # [fix -modify]
++        # w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
++        # w13_data.param_layout_transposed = True
++        # replace_parameter(layer, "w13_weight", w13_data)
++        # layer.w13_weight.param_layout_transposed = True
++
++        # w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
++        # w2_data.param_layout_transposed = True
++        # replace_parameter(layer, "w2_weight", w2_data)
++        # layer.w2_weight.param_layout_transposed = True
++
+         # Keep expert-aware loaders attached for later online weight updates.
+         w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+         replace_parameter(layer, "w13_weight", w13_data)
+@@ -117,6 +128,25 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+             if not use_megamoe:
+                 layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+                 layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
++
++
++            # [fix -modify]
++            # if use_megamoe or self.dynamic_eplb:
++            #     layer.w13_weight_list = []
++            #     for weight in layer.w13_weight.data.unbind(dim=0):
++            #         w = weight.clone()
++            #         w.param_layout_transposed = True
++            #         layer.w13_weight_list.append(w)
++
++            #     layer.w2_weight_list = []
++            #     for weight in layer.w2_weight.data.unbind(dim=0):
++            #         w = weight.clone()
++            #         w.param_layout_transposed = True
++            #         layer.w2_weight_list.append(w)
++
++            #     del layer.w13_weight
++            #     del layer.w2_weight
++            #     torch.npu.empty_cache()
+             if use_megamoe or self.dynamic_eplb:
+                 layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
+                 layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
+@@ -200,6 +230,25 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         w2 = w2_weight_list if isinstance(w2_weight_list, list) else layer.w2_weight
+         return w1, w2
+ 
++    # [fix -modify]
++    # def _maybe_transpose(self, weight, need_trans: bool):
++    #     if isinstance(weight, list):
++    #         if weight[0].shape[1] == hidden_states.shape[-1]: 
++    #             return weight
++    #         return [w.transpose(1, 2) for w in weight]
++    #     else:
++    #         if weight.shape[1] == hidden_states.shape[-1]: 
++    #         # 例如 weight.shape[1] 是 2048，x.shape[-1] 也是 2048
++    #             return weight 
++    #         return weight.transpose(1, 2)
++
++
++    #     if not need_trans:
++    #         return weight
++    #     if isinstance(weight, list):
++    #         return [w.transpose(1, 2) for w in weight]
++    #     return weight.transpose(1, 2)
++
+     def _maybe_transpose(self, weight, need_trans: bool):
+         if not need_trans:
+             return weight
+@@ -211,6 +260,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         layer = mlp_compute_input.layer
+         assert layer is not None
+         w1, _ = self.get_mlp_weights(layer)
++
++
+         w1 = self._maybe_transpose(w1, mlp_compute_input.need_trans)
+         hidden_states = mlp_compute_input.hidden_states
+         w1_bias = layer.w13_bias if self.moe.has_bias else None
+@@ -270,11 +321,117 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+             hidden_states = hidden_states * mlp_compute_input.topk_scales
+         return hidden_states, None
+ 
++    # # [fix -debug]
++    # def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):
++    #     layer = mlp_compute_input.layer
++    #     assert layer is not None
++    #     _, w2 = self.get_mlp_weights(layer)
++
++    #     # ---------------- debug prints begin ----------------
++    #     print("[apply_gmm2] ============== ENTER ==============", flush=True)
++
++    #     def _fmt(t):
++    #         if t is None:
++    #             return "None"
++    #         if isinstance(t, (list, tuple)):
++    #             return "[" + ", ".join(_fmt(x) for x in t) + "]"
++    #         try:
++    #             return f"Tensor(shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device})"
++    #         except Exception:
++    #             return repr(t)
++
++    #     print(
++    #         f"[apply_gmm2] input hidden_states = {_fmt(hidden_states)}",
++    #         flush=True,
++    #     )
++    #     print(
++    #         f"[apply_gmm2] w2 (before transpose) = {_fmt(w2)}",
++    #         flush=True,
++    #     )
++    #     print(
++    #         f"[apply_gmm2] mlp_compute_input.need_trans = {mlp_compute_input.need_trans}",
++    #         flush=True,
++    #     )
++    #     print(
++    #         f"[apply_gmm2] group_list_type = {mlp_compute_input.group_list_type}, "
++    #         f"group_list = {getattr(mlp_compute_input, 'group_list', None) if not hasattr(mlp_compute_input.group_list, 'shape') else ('Tensor', tuple(mlp_compute_input.group_list.shape))}",
++    #         flush=True,
++    #     )
++    #     print(
++    #         f"[apply_gmm2] act_out_scale = {_fmt(act_out_scale)}",
++    #         flush=True,
++    #     )
++    #     # ---------------- debug prints end ----------------
++
++    #     w2 = self._maybe_transpose(w2, mlp_compute_input.need_trans)
++
++    #     print(f"[apply_gmm2] w2 (after transpose) = {_fmt(w2)}", flush=True)
++
++    #     w2_bias = layer.w2_bias if self.moe.has_bias else None
++    #     print(f"[apply_gmm2] w2_bias = {_fmt(w2_bias)}", flush=True)
++
++    #     silu_out = hidden_states
++
++    #     # ---------- 关键：npu_grouped_matmul 的入参 ----------
++    #     x_arg = [hidden_states]
++    #     weight_arg = w2 if isinstance(w2, list) else [w2]
++    #     bias_arg = [w2_bias.to(dtype=torch.float32)] if w2_bias is not None else None
++
++    #     print(
++    #         f"[apply_gmm2] BEFORE npu_grouped_matmul: "
++    #         f"x={_fmt(x_arg)}, weight={_fmt(weight_arg)}, bias={_fmt(bias_arg)}, "
++    #         f"split_item=2, group_type=0, group_list_type={mlp_compute_input.group_list_type}",
++    #         flush=True,
++    #     )
++
++    #     # 逐元素检查 K 维（dim=1）是否一致
++    #     try:
++    #         x0 = x_arg[0]
++    #         w0 = weight_arg[0]
++    #         print(
++    #             f"[apply_gmm2] CHECK: x[0].shape={tuple(x0.shape)} (dim1={x0.shape[1]}), "
++    #             f"weight[0].shape={tuple(w0.shape)} (dim1={w0.shape[1]})",
++    #             flush=True,
++    #         )
++    #     except Exception as e:
++    #         print(f"[apply_gmm2] CHECK failed: {e}", flush=True)
++
++    #     hidden_states = torch_npu.npu_grouped_matmul(
++    #         x=x_arg,
++    #         weight=weight_arg,
++    #         bias=bias_arg,
++    #         split_item=2,
++    #         group_list_type=mlp_compute_input.group_list_type,
++    #         group_type=0,
++    #         group_list=mlp_compute_input.group_list,
++    #     )[0]
++    #     print(
++    #         f"[apply_gmm2] AFTER npu_grouped_matmul: out = {_fmt(hidden_states)}",
++    #         flush=True,
++    #     )
++
++    #     # LoRA w2 delta: applied to the down-proj output, with the activation
++    #     # output as the lora_a input.
++    #     if self._lora_routing is not None:
++    #         from vllm_ascend.lora.fused_moe import moe_lora_apply_w2
++
++    #         moe_lora_apply_w2(
++    #             self.lora_context,
++    #             down_out=hidden_states,
++    #             silu_out=silu_out,
++    #             lora_routing=self._lora_routing,
++    #         )
++    #         self._lora_routing = None
++    #     return hidden_states
++
++
+     def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):
+         layer = mlp_compute_input.layer
+         assert layer is not None
+         _, w2 = self.get_mlp_weights(layer)
++
+         w2 = self._maybe_transpose(w2, mlp_compute_input.need_trans)
++
+         w2_bias = layer.w2_bias if self.moe.has_bias else None
+         silu_out = hidden_states
+         hidden_states = torch_npu.npu_grouped_matmul(

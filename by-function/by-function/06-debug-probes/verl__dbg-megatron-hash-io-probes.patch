@@ -1,0 +1,110 @@
+# ============================================================================
+# patch : verl__dbg-megatron-hash-io-probes.patch
+# 功能  : transformer_impl.py：[DBG_MHASH] rank0 参数/缓冲 sha256 落盘（两段，后者含 buffers）；[DBG_IO] /tmp/dsv4_ioidump 存在时 dump 前向输入
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__dbg-megatron-hash-io-probes.patch
+# 对应旧编号: 无
+# 前置依赖: 须先应用 01 组 verl__megatron-vision-model-flag.patch（同文件链）
+# 备注  : 无
+# ============================================================================
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -512,6 +512,58 @@
+                 )
+ 
+         if torch.distributed.get_rank() == 0:
++            try:
++                import hashlib as _hl
++                import json as _js
++
++                _out = {}
++                for _mi, _m in enumerate(module):
++                    for _pn, _pp in _m.named_parameters():
++                        if _pp is None:
++                            continue
++                        _t = _pp.detach().data
++                        if _t.dtype == torch.bfloat16:
++                            _b = _t.contiguous().view(torch.uint16).cpu().numpy().tobytes()
++                        else:
++                            _b = _t.contiguous().cpu().numpy().tobytes()
++                        _out[f"mod{_mi}.{_pn}"] = {
++                            "shape": list(_t.shape),
++                            "dtype": str(_t.dtype),
++                            "sha": _hl.sha256(_b).hexdigest()[:16],
++                        }
++                _fp = "/mnt/share/w50065784/kimi-agent/megatron_hashes_rank0.json"
++                _js.dump(_out, open(_fp, "w"))
++                print(f"[DBG_MHASH] wrote {_fp} n={len(_out)}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_MHASH] failed {_e!r}", flush=True)
++
++        if torch.distributed.get_rank() == 0:
++            try:
++                import hashlib as _hl
++                import json as _js
++
++                _out = {}
++                for _mi, _m in enumerate(module):
++                    for _pn, _pp in list(_m.named_parameters()) + list(_m.named_buffers()):
++                        if _pp is None:
++                            continue
++                        _t = _pp.detach().data
++                        if _t.dtype == torch.bfloat16:
++                            _b = _t.contiguous().view(torch.uint16).cpu().numpy().tobytes()
++                        else:
++                            _b = _t.contiguous().cpu().numpy().tobytes()
++                        _out[f"mod{_mi}.{_pn}"] = {
++                            "shape": list(_t.shape),
++                            "dtype": str(_t.dtype),
++                            "sha": _hl.sha256(_b).hexdigest()[:16],
++                        }
++                _fp = "/mnt/share/w50065784/kimi-agent/megatron_hashes_rank0.json"
++                _js.dump(_out, open(_fp, "w"))
++                print(f"[DBG_MHASH] wrote {_fp} n={len(_out)}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_MHASH] failed {_e!r}", flush=True)
++
++        if torch.distributed.get_rank() == 0:
+             print_model_size(module[0])
+ 
+         if self.enable_routing_replay:
+@@ -1271,6 +1323,38 @@
+         input_ids = model_inputs["input_ids"]
+         attention_mask = model_inputs["attention_mask"]
+         multi_modal_inputs = model_inputs["multi_modal_inputs"]
++        import os as _os
++        if _os.path.exists("/tmp/dsv4_ioidump"):
++            try:
++                import torch.distributed as _dist
++                _r = _dist.get_rank() if _dist.is_initialized() else 0
++                _d = "/mnt/share/w50065784/kimi-agent/ioidump"
++                _os.makedirs(_d, exist_ok=True)
++                _f = f"{_d}/meg_rank{_r}.pt"
++                if not _os.path.exists(_f):
++                    _sv = {}
++                    _ii = input_ids
++                    if getattr(_ii, "is_nested", False):
++                        _sv["input_ids"] = _ii.values().detach().cpu()
++                        _sv["offsets"] = _ii.offsets().detach().cpu()
++                    else:
++                        _sv["input_ids"] = _ii.detach().cpu()
++                    for _k in ("position_ids", "attention_mask", "loss_mask"):
++                        _v = model_inputs.get(_k)
++                        if _v is not None and hasattr(_v, "detach"):
++                            _sv[_k] = _v.detach().cpu()
++                    if multi_modal_inputs is not None:
++                        _mm = {}
++                        for _k, _v in (multi_modal_inputs.items() if hasattr(multi_modal_inputs, "items") else []):
++                            if hasattr(_v, "shape") and hasattr(_v, "detach"):
++                                _mm[_k] = _v.detach().cpu() if _v.numel() < 200000 else _v.shape
++                            else:
++                                _mm[_k] = _v if isinstance(_v, (int, float, str)) else str(type(_v))
++                        _sv["multi_modal_inputs"] = _mm
++                    torch.save(_sv, _f)
++                    print(f"[DBG_IO] wrote {_f} keys={list(_sv.keys())}", flush=True)
++            except Exception as _e:
++                print(f"[DBG_IO] failed {_e!r}", flush=True)
+         local_cp_size = tu.get_non_tensor_data(data=batch, key="local_cp_size", default=None)
+         if self.engine_config.dynamic_context_parallel and local_cp_size is None:
+             raise RuntimeError("Dynamic CP micro-batch is missing local_cp_size")

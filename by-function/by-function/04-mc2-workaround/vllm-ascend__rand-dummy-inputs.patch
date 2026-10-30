@@ -1,0 +1,30 @@
+# ============================================================================
+# patch : vllm-ascend__rand-dummy-inputs.patch
+# 功能  : [DSV4_RAND_DUMMY] VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1 时随机化 DP dummy 输入（排除 >=129257 视觉 sentinel），避免全零 dummy 导致 MoE 路由退化、MC2 combine 超时
+# 仓库  : /vllm-workspace/main/zyy/vllm-ascend
+# 应用  : cd /vllm-workspace/main/zyy/vllm-ascend && patch -p1 < vllm-ascend__rand-dummy-inputs.patch
+# 对应旧编号: 0009
+# 前置依赖: 须先应用 01 组 vllm-ascend__kv-cache-sleep-pool.patch（同文件链）
+# 备注  : 无
+# ============================================================================
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -3895,6 +3895,17 @@
+             else:
+                 input_ids = self.input_ids.gpu[:num_tokens_padded]
+                 inputs_embeds = None
++                # [DSV4_RAND_DUMMY] port of upstream maybe_randomize_inputs:
++                # zero dummy inputs make MoE routing degenerate (hash layers
++                # lock to tid2eid[0], gate ties on zeros) -> most EP ranks get
++                # zero tokens -> MoeDistributeCombineV2 vector core timeout.
++                # Random ids scatter routing across all experts. Sentinel ids
++                # (>=129257) are excluded to stay off the vision path.
++                import os as _os
++                if _os.environ.get("VLLM_RANDOMIZE_DP_DUMMY_INPUTS", "0") == "1":
++                    input_ids.copy_(torch.randint(
++                        low=0, high=129257, size=(num_tokens_padded,),
++                        dtype=input_ids.dtype, device=input_ids.device))
+ 
+             if self.uses_mrope:
+                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]

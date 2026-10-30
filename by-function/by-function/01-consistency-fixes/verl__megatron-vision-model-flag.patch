@@ -1,0 +1,38 @@
+# ============================================================================
+# patch : verl__megatron-vision-model-flag.patch
+# 功能  : transformer_impl.py：vision_model 判定增加按模块名识别（vision/vlm），LMHead/ValueHead 两处；仅含功能性 hunk，DBG_MHASH/DBG_IO 探针在 06 组
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__megatron-vision-model-flag.patch
+# 对应旧编号: 无
+# 前置依赖: 无（与同文件 06 组 verl__dbg-megatron-hash-io-probes.patch 互为基础链：本 patch 须先应用）
+# 备注  : 无
+# ============================================================================
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -1386,7 +1386,11 @@
+                 multi_modal_inputs,
+                 logits_processor=logits_processor,
+                 logits_processor_args=logits_processor_args,
+-                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++                # vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++                vision_model=(
++                    hasattr(self.model_config.hf_config, "vision_config")
++                    or any(k in type(unwrap_model(model)).__name__.lower() for k in ("vision", "vlm"))
++                ),
+                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                 data_format=data_format,
+                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+@@ -1513,7 +1517,11 @@
+             input_ids,
+             multi_modal_inputs,
+             value_model=True,
+-            vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++            # vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++            vision_model=(
++                hasattr(self.model_config.hf_config, "vision_config")
++                or any(k in type(unwrap_model(model)).__name__.lower() for k in ("vision", "vlm"))
++            ),
+             pad_token_id=self.model_config.tokenizer.pad_token_id,
+             data_format="thd" if self.engine_config.use_remove_padding else "bshd",
+             forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),

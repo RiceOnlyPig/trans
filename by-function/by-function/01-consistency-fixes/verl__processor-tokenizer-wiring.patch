@@ -1,0 +1,159 @@
+# ============================================================================
+# patch : verl__processor-tokenizer-wiring.patch
+# 功能  : DeepseekV4Processor 直接构建（绕过 transformers remote-code 缓存缺陷）、DeepSeekV4VL continuous token builder 注册、trainer_base processor 兜底加载
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__processor-tokenizer-wiring.patch
+# 对应旧编号: 无
+# 备注  : 无
+# ============================================================================
+diff --git a/verl/utils/tokenizer/tokenizer.py b/verl/utils/tokenizer/tokenizer.py
+index 65f528bb..e02b6042 100644
+--- a/verl/utils/tokenizer/tokenizer.py
++++ b/verl/utils/tokenizer/tokenizer.py
+@@ -193,7 +193,40 @@ def hf_processor(name_or_path, **kwargs):
+     from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
+ 
+     try:
+-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
++        processor = None
++        # Direct-build for deepseek_v4: transformers remote-code caching copies
++        # only the auto_map module out of the model dir, which breaks our
++        # self-contained sibling imports (image_processor.py / encoding_dsv4.py).
++        import importlib.util as _ilu
++        import os as _os
++
++        from transformers import AutoConfig as _AC
++
++        _cfg_try = None
++        try:
++            _cfg_try = _AC.from_pretrained(name_or_path, **kwargs)
++        except Exception:
++            _cfg_try = None
++        if _cfg_try is not None and getattr(_cfg_try, "model_type", None) == "deepseek_v4":
++            _proc_path = _os.path.join(name_or_path, "processing_deepseek_v4.py")
++            if not _os.path.exists(_proc_path):
++                _proc_path = _os.path.join(
++                    _os.path.dirname(_os.path.abspath(name_or_path)),
++                    "DeepSeek-V4-Processor",
++                    "processing_deepseek_v4.py",
++                )
++            if _os.path.exists(_proc_path):
++                _spec = _ilu.spec_from_file_location("dsv4_processor_direct", _proc_path)
++                _mod = _ilu.module_from_spec(_spec)
++                _spec.loader.exec_module(_mod)
++                from transformers import AutoTokenizer as _AT
++
++                processor = _mod.DeepseekV4Processor(
++                    tokenizer=_AT.from_pretrained(name_or_path, **kwargs),
++                    vocab_size=getattr(_cfg_try, "vocab_size", 129280),
++                )
++        if processor is None:
++            processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+         # In newer transformers, AutoProcessor may legitimately fall back to a
+         # tokenizer backend (e.g. TokenizersBackend) for text-only models.
+         # Treat it as "no multimodal processor" and let callers use hf_tokenizer.
+@@ -228,10 +261,14 @@ def hf_processor(name_or_path, **kwargs):
+                 model_class = Glm46VModel
+             case "MllamaProcessor":
+                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
++            case "DeepseekV4VLProcessor":
++                pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+             case "Gemma4Processor":
+                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
+                 # per-image-token check (which Qwen's processor lacks).
+                 processor.validate_inputs = lambda *args, **kwargs: None
++            case "DeepseekV4Processor":
++                pass
+             case _:
+                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
+ 
+diff --git a/verl/utils/tokenizer/deepseek.py b/verl/utils/tokenizer/deepseek.py
+index fab6ff87..080152fc 100644
+--- a/verl/utils/tokenizer/deepseek.py
++++ b/verl/utils/tokenizer/deepseek.py
+@@ -34,7 +34,7 @@ from __future__ import annotations
+ import json
+ from typing import Any, Optional
+ 
+-from .continuous_token import ContinuousTokenBuilder, MergeResult, require_token_id
++from .continuous_token import ContinuousTokenBuilder, MergeResult, require_token_id, VLContinuousTokenMixin
+ from .tokenizer import normalize_token_ids
+ 
+ BOS_TOKEN = "<｜begin▁of▁sentence｜>"
+@@ -358,3 +358,14 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
+             kind="non_assistant",
+             inserted_token_ids=inserted_token_ids,
+         )
++
++
++class DeepSeekV4VLContinuousTokenBuilder(VLContinuousTokenMixin, DeepSeekV4ContinuousTokenBuilder):
++    """DeepSeek-V4 vision-language continuous token builder.
++
++    Renders through the multimodal processor (official encoding_dsv4 +
++    image_processor logic) and reuses DeepSeek-V4 turn-boundary merging.
++    Selected automatically when model_type='deepseek_v4' carries a processor.
++    """
++
++    pass
+diff --git a/verl/utils/tokenizer/continuous_token_wiring.py b/verl/utils/tokenizer/continuous_token_wiring.py
+index 446348f6..b804dcb0 100644
+--- a/verl/utils/tokenizer/continuous_token_wiring.py
++++ b/verl/utils/tokenizer/continuous_token_wiring.py
+@@ -36,7 +36,7 @@ from .continuous_token import (
+     QwenVLContinuousTokenBuilder,
+     VLContinuousTokenBuilder,
+ )
+-from .deepseek import DeepSeekV4ContinuousTokenBuilder
++from .deepseek import DeepSeekV4ContinuousTokenBuilder, DeepSeekV4VLContinuousTokenBuilder
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -73,6 +73,7 @@ class ContinuousTokenModelFamily(str, Enum):
+     GLM4V = "glm4v"
+     DEEPSEEK_VL2 = "deepseekvl2"
+     DEEPSEEKV4 = "deepseekv4"
++    DEEPSEEKV4_VL = "deepseekv4vl"
+ 
+ 
+ _CONTINUOUS_TOKEN_BUILDER_REGISTRY: dict[ContinuousTokenModelFamily, type[Any]] = {
+@@ -101,6 +102,7 @@ _CONTINUOUS_TOKEN_BUILDER_REGISTRY: dict[ContinuousTokenModelFamily, type[Any]]
+     ContinuousTokenModelFamily.GLM4V: GLM46VContinuousTokenBuilder,
+     ContinuousTokenModelFamily.DEEPSEEK_VL2: DeepSeekVL2ContinuousTokenBuilder,
+     ContinuousTokenModelFamily.DEEPSEEKV4: DeepSeekV4ContinuousTokenBuilder,
++    ContinuousTokenModelFamily.DEEPSEEKV4_VL: DeepSeekV4VLContinuousTokenBuilder,
+ }
+ 
+ CONTINUOUS_TOKEN_BUILDER_FAMILIES = tuple(family.value for family in _CONTINUOUS_TOKEN_BUILDER_REGISTRY)
+@@ -147,6 +149,7 @@ _TEXT_TO_VL_FAMILY: dict[ContinuousTokenModelFamily, ContinuousTokenModelFamily]
+     ContinuousTokenModelFamily.DEFAULT: ContinuousTokenModelFamily.VL_DEFAULT,
+     ContinuousTokenModelFamily.GEMMA4: ContinuousTokenModelFamily.GEMMA4_VL,
+     ContinuousTokenModelFamily.QWEN35: ContinuousTokenModelFamily.QWEN3_VL,
++    ContinuousTokenModelFamily.DEEPSEEKV4: ContinuousTokenModelFamily.DEEPSEEKV4_VL,
+ }
+ 
+ 
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 4dd52d16..eba9a4d7 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -654,6 +654,20 @@ class PPOTrainer(ABC):
+         # Used for multimodal LLM, could be None
+         self.processor = model_config.processor
+ 
++        if self.processor is None:
++            _data_processor = self.config.data.get("processor", None)
++            if _data_processor is not None:
++                from verl.utils.tokenizer.tokenizer import hf_processor
++
++                self.processor = hf_processor(
++                    _data_processor,
++                    trust_remote_code=self.config.actor_rollout_ref.model.trust_remote_code,
++                )
++                if self.processor is not None and not getattr(self.processor, "chat_template", None):
++                    self.processor.chat_template = getattr(self.tokenizer, "chat_template", None)
++                if self.processor is None:
++                    print(f"[dsv4] data.processor={_data_processor} could not be loaded; falling back to None")
++
+     def _init_dataloader(self):
+         """Initialize train and validate dataloader."""
+         self.train_dataset = create_rl_dataset(

@@ -1,0 +1,80 @@
+# ============================================================================
+# patch : verl__rollout-server-tweaks.patch
+# 功能  : generation server 单 replica + error 字段透传抛错；sleep level 调整（third_party VLLM_SLEEP_LEVEL 2→1、engine_workers peft 路径 1→2、dapo shell enable_sleep_mode=False）
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__rollout-server-tweaks.patch
+# 对应旧编号: 无
+# 备注  : sleep level/单 replica 为环境相关调参，按需采纳
+# ============================================================================
+diff --git a/verl/trainer/main_generation_server.py b/verl/trainer/main_generation_server.py
+index 23cf570c..d7605940 100644
+--- a/verl/trainer/main_generation_server.py
++++ b/verl/trainer/main_generation_server.py
+@@ -39,7 +39,8 @@ from verl.workers.rollout.replica import get_rollout_replica_class
+ 
+ async def start_server(config):
+     tp_size = config.actor_rollout_ref.rollout.tensor_model_parallel_size
+-    num_replicas = (config.trainer.n_gpus_per_node * config.trainer.nnodes) // tp_size
++    num_replicas = 1
++    # num_replicas = (config.trainer.n_gpus_per_node * config.trainer.nnodes) // tp_size
+     rollout_config = config.actor_rollout_ref.rollout
+     model_config = config.actor_rollout_ref.model
+     # create standalone rollout server
+@@ -74,6 +75,18 @@ async def submit_request(server_address, **chat_complete_request):
+             json=chat_complete_request,
+         ) as resp:
+             data = await resp.json()
++
++            if isinstance(data, dict) and "error" in data:
++                err = data["error"]
++                raise RuntimeError(
++                    f"Generation server error: "
++                    f"message={err.get('message')}, "
++                    f"type={err.get('type')}, "
++                    f"param={err.get('param')}, "
++                    f"code={err.get('code')}"
++                )
++
++
+             return ChatCompletion(**data)
+     finally:
+         await session.close()
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index cc4219e3..5534d69e 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -788,7 +788,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         do_lora_base_sync = False
+         if not self.peft_merge and peft_config is not None:
+-            self.rollout.sleep_level = 1
++            self.rollout.sleep_level = 2
+             do_lora_base_sync = not self.base_sync_done
+ 
+         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
+diff --git a/verl/third_party/vllm/__init__.py b/verl/third_party/vllm/__init__.py
+index 505c9022..ffb2b372 100644
+--- a/verl/third_party/vllm/__init__.py
++++ b/verl/third_party/vllm/__init__.py
+@@ -45,7 +45,7 @@ elif is_npu_available:
+     from vllm.distributed import parallel_state
+ elif vs.parse(package_version) >= vs.parse("0.18.0"):
+     vllm_version = package_version
+-    VLLM_SLEEP_LEVEL = 2
++    VLLM_SLEEP_LEVEL = 1
+     from vllm import LLM
+     from vllm.distributed import parallel_state
+ else:
+diff --git a/verl/experimental/fully_async_policy/shell/dapo_30b_a3b_base_math_fsdp.sh b/verl/experimental/fully_async_policy/shell/dapo_30b_a3b_base_math_fsdp.sh
+index 9f74f6d3..e364a6e5 100644
+--- a/verl/experimental/fully_async_policy/shell/dapo_30b_a3b_base_math_fsdp.sh
++++ b/verl/experimental/fully_async_policy/shell/dapo_30b_a3b_base_math_fsdp.sh
+@@ -80,7 +80,7 @@ trigger_parameter_sync_step=$((train_bsz / ( train_prompt_mini_bsz * require_bat
+ partial_rollout=True
+ enforce_eager=False
+ nccl_timeout=72000
+-enable_sleep_mode=True
++enable_sleep_mode=False
+ 
+ # Performance Related Parameter
+ sp_size=4

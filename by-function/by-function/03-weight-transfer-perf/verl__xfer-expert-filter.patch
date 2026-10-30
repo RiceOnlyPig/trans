@@ -1,0 +1,191 @@
+# ============================================================================
+# patch : verl__xfer-expert-filter.patch
+# 功能  : EP 专家过滤：发送侧 DSV4_XFER_SENDER_EXPERT_FILTER 只流式传输对端本地专家（BucketedWeightSender expert_filter）；接收侧 _xfer_drop_nonlocal_experts 丢弃非本地 expert 张量（可用 DSV4_XFER_NO_RECV_EXPERT_FILTER=1 关闭）；并补齐 patch_vllm_moe_model_weight_loader 调用
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__xfer-expert-filter.patch
+# 对应旧编号: 0008
+# 备注  : 同文件探针（DBG_XFER/LOAD_PROF 计时）在 06 组；vllm/utils/vllm/patch.py 为纯空白 hunk，一并在此（无功能变化）
+# ============================================================================
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -20,6 +20,7 @@
+ import gc
+ import logging
+ import os
++import re
+ from multiprocessing import shared_memory
+ from typing import Callable, TypedDict
+ 
+@@ -33,6 +34,9 @@
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++_XFER_EXPERT_RE = re.compile(r"\.experts\.(\d+)\.(?:w1|w2|w3)\.weight$")
++
++
+ class TensorMetadata(TypedDict):
+     name: str
+     shape: torch.Size
+@@ -89,8 +93,10 @@
+         zmq_handle: str,
+         bucket_size_mb: int = 512,
+         use_shm: bool = False,
++        expert_filter: int | None = None,
+     ):
+         self.zmq_handle = zmq_handle
++        self.expert_filter = expert_filter
+         self.bucket_size_mb = bucket_size_mb
+         self.bucket_size = int(bucket_size_mb) << 20
+         self.use_shm = use_shm
+@@ -118,6 +124,10 @@
+             bucket_meta: dict[str, TensorMetadata] = {}
+             # dtype = PrecisionType.to_dtype(self.config.dtype)
+             async for name, weight in ensure_async_iterator(weights):
++                if self.expert_filter is not None:
++                    _efm = _XFER_EXPERT_RE.search(name)
++                    if _efm is not None and int(_efm.group(1)) != self.expert_filter:
++                        continue
+                 # model parameters are in fp32 full precision
+                 # (vermouth1992) we should not force cast weight here because some parameters
+                 # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout.py b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+index 79a08d5d..7e9809b9 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -127,7 +127,6 @@ class ServerAdapter(BaseRollout):
+             self.sleep_level = 1
+         else:
+             self.sleep_level = VLLM_SLEEP_LEVEL
+-
+         # Use replica_rank + node-local rank to form ZMQ handle instead of GPU UUID,
+         # because CheckpointEngineWorker and vLLM worker may see different GPU UUIDs
+         # when CUDA_VISIBLE_DEVICES differs between processes (common on ROCm/AMD).
+@@ -233,10 +232,16 @@ class ServerAdapter(BaseRollout):
+         )
+ 
+         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
++        expert_filter = None
++        if os.environ.get("DSV4_XFER_SENDER_EXPERT_FILTER", "0") == "1":
++            # EP colocate: the paired engine keeps only its own local physical
++            # expert (ep_rank == zmq rank here); skip streaming the other experts.
++            expert_filter = int(self.zmq_handle.rsplit("-rank-", 1)[1].split(".")[0])
+         sender = BucketedWeightSender(
+             zmq_handle=self.zmq_handle,
+             bucket_size_mb=bucket_size_mb,
+             use_shm=self.use_shm,
++            expert_filter=expert_filter,
+         )
+         await sender.async_send_weights(weights)
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -18,6 +18,7 @@
+ import logging
+ import os
+ import platform
++import re
+ import signal
+ import threading
+ from collections.abc import Mapping
+@@ -44,6 +45,9 @@
+ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+ 
+ 
++_XFER_EXPERT_RE = re.compile(r"\.experts\.(\d+)\.(?:w1|w2|w3)\.weight$")
++
++
+ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+     worker_local_rank = int(worker_local_rank)
+     if parallel_config is None:
+@@ -321,6 +325,8 @@
+                 )
+                 lora_weights.clear()
+                 return
++
++
+             self._update_weights(
+                 weights,
+                 peft_config=peft_config,
+@@ -403,8 +409,17 @@
+                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
+                 )
+             else:
++                if (
++                    param_updates
++                    and peft_config is None
++                    and is_npu_available
++                    and os.environ.get("DSV4_XFER_NO_RECV_EXPERT_FILTER", "0") != "1"
++                ):
++                    param_updates = self._xfer_drop_nonlocal_experts(param_updates)
+                 if param_updates:
+                     for model in self._iter_all_models():
++                        patch_vllm_moe_model_weight_loader(model)
++
+                         if peft_config is None:
+                             model.load_weights(param_updates)
+                         else:
+@@ -417,6 +432,44 @@
+                     f"loaded_params: {len(param_updates)}, loaded_buffers: {loaded_buffers}"
+                 )
+ 
++    def _xfer_local_expert_ids(self):
++        ids = getattr(self, "_xfer_local_expert_id_set", "__unset__")
++        if ids != "__unset__":
++            return ids
++        ids = None
++        for model in self._iter_all_models():
++            m = model
++            if hasattr(m, "runnable") and "ACLGraphWrapper" in str(type(m)):
++                m = m.runnable
++            for module in m.modules():
++                start = getattr(module, "physical_expert_start", None)
++                n_local = getattr(module, "n_local_physical_experts", None)
++                if start is not None and n_local is not None:
++                    ids = set(range(int(start), int(start) + int(n_local)))
++                    break
++            if ids is not None:
++                break
++        self._xfer_local_expert_id_set = ids
++        return ids
++
++    def _xfer_drop_nonlocal_experts(self, param_updates):
++        """Drop expert weights this engine discards anyway (EP: the vLLM loader
++        skips experts not mapped locally), keeping them out of the per-tensor
++        load path entirely."""
++        ids = self._xfer_local_expert_ids()
++        if ids is None:
++            return param_updates
++        kept, dropped = [], 0
++        for name, tensor in param_updates:
++            mm = _XFER_EXPERT_RE.search(name)
++            if mm is not None and int(mm.group(1)) not in ids:
++                dropped += 1
++                continue
++            kept.append((name, tensor))
++        if dropped:
++            print(f"[XFER_EPFILTER] dropped {dropped} non-local expert tensors, local ids={sorted(ids)}", flush=True)
++        return kept
++
+     def _get_zmq_handle(self) -> str:
+         """Get ZMQ handle for communication.
+ 
+diff --git a/verl/utils/vllm/patch.py b/verl/utils/vllm/patch.py
+index 1e2224f6..1ec48185 100644
+--- a/verl/utils/vllm/patch.py
++++ b/verl/utils/vllm/patch.py
+@@ -93,10 +93,13 @@ def patch_vllm_moe_model_weight_loader(model):
+     # (False, 'model.layers.0.mlp.experts.w2_weight')          use mlp.experts.weight_loader
+ 
+     # Early return if no MOE models are supported
++
++
+     if not SUPPORTED_MOE_MODELS:
+         return
+ 
+     original_model_type = type(model)
++
+     if hasattr(model, "runnable") and "ACLGraphWrapper" in str(original_model_type):
+         model = model.runnable
+         original_model_type = type(model)

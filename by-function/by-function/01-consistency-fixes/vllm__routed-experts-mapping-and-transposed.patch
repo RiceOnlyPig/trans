@@ -1,0 +1,184 @@
+# ============================================================================
+# patch : vllm__routed-experts-mapping-and-transposed.patch
+# 功能  : 上游 vllm RoutedExperts：expert params mapping 增加 lora_base_layer_prefix_on_param_name 区分 checkpoint/param 两侧前缀；is_fused_checkpoint_transposed 硬置 True；UnfinalizedMoEOutput 返回类型标注
+# 仓库  : /vllm-workspace/main/zyy/vllm
+# 应用  : cd /vllm-workspace/main/zyy/vllm && patch -p1 < vllm__routed-experts-mapping-and-transposed.patch
+# 对应旧编号: 无
+# 备注  : 未拆分，混合功能：另含一行 weight_loader logger.info 调试日志与注释掉的实验代码
+# ============================================================================
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 87fc3b1c36..faae2abf9c 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+     FusedMoEMethodBase,
+ )
++from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+     UnquantizedFusedMoEMethod,
+ )
+@@ -87,7 +88,8 @@ class RoutedExperts(PluggableLayer):
+         self.ckpt_gate_proj_name = ckpt_gate_proj_name
+         self.ckpt_down_proj_name = ckpt_down_proj_name
+         self.ckpt_up_proj_name = ckpt_up_proj_name
+-        self.is_fused_checkpoint_transposed = is_fused_checkpoint_transposed
++        self.is_fused_checkpoint_transposed = True
++        # self.is_fused_checkpoint_transposed = is_fused_checkpoint_transposed
+         self.expert_map_manager = expert_map_manager
+         self.hidden_size = moe_config.hidden_dim
+         self.global_num_experts = moe_config.num_experts
+@@ -515,6 +517,8 @@ class RoutedExperts(PluggableLayer):
+         else:
+             assert shard_id == "w3"
+             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
++
++
+         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
+         expert_data = self._narrow_expert_data_for_padding(
+             expert_data,
+@@ -619,6 +623,25 @@ class RoutedExperts(PluggableLayer):
+         expert_id: int,
+         return_success: bool = False,
+     ) -> bool | None:
++        logger.info(
++            "[weight_loader] name=%s shard_id=%s expert_id=%s "
++            "loaded_shape=%s loaded_dim=%d loaded_dtype=%s "
++            "param_shape=%s param_dtype=%s "
++            "is_transposed=%s is_fused_checkpoint_transposed=%s",
++            weight_name,
++            shard_id,
++            expert_id,
++            tuple(loaded_weight.shape),
++            loaded_weight.ndim,
++            loaded_weight.dtype,
++            tuple(param.shape),
++            param.dtype,
++            getattr(param, "is_transposed", False),
++            self.is_fused_checkpoint_transposed,
++        )
++
++
++
+         quant_config_name = self.quant_config and self.quant_config.get_name()
+         if quant_config_name == "gpt_oss_mxfp4":
+             # (FIXME) for gpt-oss all experts are combined
+@@ -649,7 +672,22 @@ class RoutedExperts(PluggableLayer):
+         # should be flipped. Required by GPTQ, compressed-tensors
+         # should be whatever dimension intermediate_size_per_partition is
+         is_transposed = getattr(param, "is_transposed", False)
+-
++        
++        # [fix -add]
++        # param_layout_transposed = getattr(param, "param_layout_transposed", False)
++        # if (
++        #     param_layout_transposed
++        #     and loaded_weight.ndim == 2
++        #     and shard_id in ("w1", "w2", "w3")
++        # ):
++        # if (
++        #     loaded_weight.ndim == 2
++        #     and shard_id in ("w1", "w2", "w3")
++        # ):
++            
++        #     loaded_weight = loaded_weight.transpose(0, 1).contiguous()
++        
++        
+         # compressed-tensors checkpoints with packed weights are stored flipped
+         # TODO (mgoin): check self.quant_method.quant_config.quant_format
+         # against known CompressionFormat enum values that have this quality
+@@ -671,6 +709,11 @@ class RoutedExperts(PluggableLayer):
+         # dimension intermediate_size_per_partition is used.
+         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
++
++        # [fix -modify]
++        # if is_transposed or param_layout_transposed:
++        #     shard_dim = int(not shard_dim)
++
+         if is_transposed:
+             shard_dim = int(not shard_dim)
+ 
+@@ -1001,6 +1044,8 @@ class RoutedExperts(PluggableLayer):
+         See `build_expert_params_mapping` for the returned tuple format.
+         """
+         has_base_layer = any(".base_layer." in n for n, _ in model.named_parameters())
++        prefix = "base_layer." if has_base_layer else ""
++        # These loaders index ``params_dict[full_name]``, so both sides get it.
+         return RoutedExperts.build_expert_params_mapping(
+             ckpt_gate_proj_name,
+             ckpt_down_proj_name,
+@@ -1008,7 +1053,8 @@ class RoutedExperts(PluggableLayer):
+             num_experts,
+             num_redundant_experts,
+             routed_experts_prefix,
+-            "base_layer." if has_base_layer else "",
++            lora_base_layer_prefix=prefix,
++            lora_base_layer_prefix_on_param_name=prefix,
+         )
+ 
+     @staticmethod
+@@ -1020,6 +1066,7 @@ class RoutedExperts(PluggableLayer):
+         num_redundant_experts: int = 0,
+         routed_experts_prefix: str = "routed_experts",
+         lora_base_layer_prefix: str = "",
++        lora_base_layer_prefix_on_param_name: str = "",
+         include_fused: bool = False,
+     ) -> list[tuple[str, str, int, str]]:
+         """
+@@ -1034,7 +1081,14 @@ class RoutedExperts(PluggableLayer):
+             ckpt_up_proj_name: Name of up projection in checkpoint
+             num_experts: Number of logical (non-redundant) experts
+             num_redundant_experts: Number of redundant experts
+-            lora_base_layer_prefix: Prefix to add if this layer is a LoRA base layer
++            lora_base_layer_prefix: LoRA ``base_layer.`` prefix for the
++                ``weight_name`` (checkpoint) side
++            lora_base_layer_prefix_on_param_name: same, for the ``param_name``
++                side. Independent because ``get_expert_mapping`` resolves
++                ``param_name`` via ``getattr`` against this layer's bare
++                ``w13_weight``/``w2_weight`` (no prefix), while
++                ``make_expert_params_mapping`` indexes the model-wide
++                ``params_dict`` (prefix included).
+             include_fused: Prepend the fused pre-fused-checkpoint entries
+ 
+         Returns:
+@@ -1060,8 +1114,10 @@ class RoutedExperts(PluggableLayer):
+         if routed_experts_prefix != "":
+             routed_experts_prefix = f"{routed_experts_prefix}."
+ 
+-        w13 = f"experts.{routed_experts_prefix}{lora_base_layer_prefix}w13_"
+-        w2 = f"experts.{routed_experts_prefix}{lora_base_layer_prefix}w2_"
++        w13 = (
++            f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w13_"
++        )
++        w2 = f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w2_"
+ 
+         fused_mapping = []
+         if include_fused:
+@@ -1216,7 +1272,7 @@ class RoutedExperts(PluggableLayer):
+             shared_experts_input: Input for shared experts (if any)
+ 
+         Returns:
+-            Output tensor from routed experts
++            Output tensor from routed experts.
+         """
+         assert not self.quant_method.is_monolithic
+ 
+@@ -1235,7 +1291,7 @@ class RoutedExperts(PluggableLayer):
+         x: torch.Tensor,
+         router_logits: torch.Tensor | None = None,
+         input_ids: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | UnfinalizedMoEOutput:
+         """
+         Execute routed experts using the quantization method's apply function.
+ 
+@@ -1250,7 +1306,7 @@ class RoutedExperts(PluggableLayer):
+             input_ids: input ids for DeepSeek V4
+ 
+         Returns:
+-            Output tensor from routed experts
++            Finalized routed states or a deferred-finalize output.
+         """
+         assert self.quant_method.is_monolithic
+ 

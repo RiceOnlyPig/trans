@@ -1,0 +1,74 @@
+# ============================================================================
+# patch : verl__env-config-knobs.patch
+# 功能  : 环境配置：ppo_megatron_trainer.yaml 增加 NPU profiler 配置、constants_ppo VLLM_LOGGING_LEVEL WARN→INFO、geo3k 数据集默认路径
+# 仓库  : /workspace/verl
+# 应用  : cd /workspace/verl && patch -p1 < verl__env-config-knobs.patch
+# 对应旧编号: 无
+# 备注  : 均为环境/调参相关，非功能性修复，可选
+# ============================================================================
+diff --git a/verl/trainer/config/ppo_megatron_trainer.yaml b/verl/trainer/config/ppo_megatron_trainer.yaml
+index 2ebe9c78..95f5d330 100644
+--- a/verl/trainer/config/ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/ppo_megatron_trainer.yaml
+@@ -4,3 +4,35 @@ defaults:
+   - ppo_trainer
+   - override model_engine: megatron
+   - _self_
++global_profiler:
++   steps: [1, 2, 5]
++   save_path: /mnt/share/w50065784/outputs/profile
++actor_rollout_ref:
++   actor:
++      profiler:
++         enable: True  # 设置为 True 以采集训练阶段
++         all_ranks: False
++         ranks: [0]  # 全局 Rank 0
++         tool_config:
++            npu:
++               discrete: True
++               contents: [npu, cpu]
++   rollout:
++      profiler:
++         enable: True  # 设置为 True 以采集推理阶段
++         all_ranks: False
++         ranks: [0]  # 全局 GPU rank；会被映射到拥有该 rank 的推理实例（replica）
++         tool_config:
++            npu:
++               discrete: True  # Agent Loop 模式下必须开启离散模式
++
++   # ref follow actor settings
++   ref:
++      profiler:
++         enable: True  # 设置为 True 以采集训练阶段
++         all_ranks: False
++         ranks: [0]  # 全局 Rank 0
++         tool_config:
++            npu:
++               discrete: True
++               contents: [npu, cpu]
+diff --git a/verl/trainer/constants_ppo.py b/verl/trainer/constants_ppo.py
+index 20a89212..017bb982 100644
+--- a/verl/trainer/constants_ppo.py
++++ b/verl/trainer/constants_ppo.py
+@@ -86,7 +86,7 @@ PPO_RAY_RUNTIME_ENV = {
+     "env_vars": {
+         "TOKENIZERS_PARALLELISM": "true",
+         "NCCL_DEBUG": "WARN",
+-        "VLLM_LOGGING_LEVEL": "WARN",
++        "VLLM_LOGGING_LEVEL": "INFO",
+         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+         # TODO: disable compile cache due to cache corruption issue
+         # https://github.com/vllm-project/vllm/issues/31199
+diff --git a/examples/data_preprocess/geo3k.py b/examples/data_preprocess/geo3k.py
+index ba84fd3f..104a33f0 100644
+--- a/examples/data_preprocess/geo3k.py
++++ b/examples/data_preprocess/geo3k.py
+@@ -28,7 +28,7 @@ if __name__ == "__main__":
+     parser.add_argument("--hdfs_dir", default=None)
+     parser.add_argument("--local_dataset_path", default=None, help="The local path to the raw dataset, if it exists.")
+     parser.add_argument(
+-        "--local_save_dir", default="~/data/geo3k", help="The save directory for the preprocessed dataset."
++        "--local_save_dir", default="/mnt/share/w50065784/datasets/geometry3k", help="The save directory for the preprocessed dataset."
+     )
+ 
+     args = parser.parse_args()
