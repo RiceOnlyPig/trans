@@ -535,3 +535,65 @@ if __name__ == "__main__":
 
     main(args.input_fp8_hf_path, args.output_hf_path,
          args.quant_type, args.quant_param_path)
+
+从全套补丁和 processor 里筛出**以提高性能为目的**（或附带显著性能收益）的项，按收益类型分类：
+
+## 一、直接提升计算/通信性能的补丁
+
+**1. vllm-ascend `0002-vision-kernel-align`（推理端，收益最直接）**
+把视觉塔四个算子从纯 PyTorch eager 换回 CANN 融合算子：
+
+| 算子 | 原实现 | 换成 |
+|---|---|---|
+| RoPE | 手写 index/mul | `npu_rotary_mul`（bf16 cos/sin，half 模式） |
+| RMSNorm | 手写 float() 归一化 | `npu_rms_norm` |
+| Attention | SDPA | `npu_fusion_attention_v3` |
+| SwiGLU | `F.silu(gate)*up` | `npu_swiglu` |
+
+这是全套 patch 里性能语义最明确的一个：视觉塔每层从多个 eager kernel 变成 4 个融合 kernel，rollout 端视觉的 kernel 启动开销和访存都显著下降。代价是 README 自述**不保证与训练侧逐位一致**——属于"用一点数值风险换速度"。
+
+**2. mindspeed-bridge 内的 mHC 融合后端训练端）**
+`hyper_connection.py` + `mhc_fused.py` 的双后端重构：Ascend 上走 CANN `mhc_fused` 算子，把 mHC 的 projection+RMSNorm+split 合成 `split_pre_sinkhorn` 一次 launch（限 4 流 hc_mult=4），替代逐 op eager 链。超连接是 DSv4 每层都跑的组件，这是训练端最大的单点 kernel 级加速。
+
+**3. minds-bridge 的 MoE 前反向 overlap（`moe_fb_overlap.py`，默认关）**
+通信与计算重叠，直接提升训练吞吐。但 README 明确：**grouped 布局会破坏 SequentialExperts 的 HF 权重映射，只适合测试，不能用于真实 load/save checkpoint**——要用它得接受 checkpoint 格式不兼容。
+
+**4. mindspeed-bridge 的融合 wgrad 选择（`weight_grad_store_overlap_matmul_wrapper`）**
+MindSpeed 延迟 wgrad 用全局 flag 决定走不走融合 kernel，Bridge 改成把选择记在 weight 上逐 Linear 延迟执行—— MoE 层多、Linear 密集的场景避免"一刀切" eager/matmul+add 回退。
+
+## 二、降显存 → 间接提性能（更大 batch / 更少 offload）
+
+**5. verl `npu_expert_layout.py`（零拷贝转置）**
+权重同步前把专家权重从推理布局转回 checkpoint 布局时**用 view 而非 copy**（单层 w13 就 2.11 GiB）。直接收益：trainer↔rollout 权重同步的峰值主机内存省数 GB×层数，避免同步时内存打爆拖慢或 OOM。
+
+**6. processor 的 token 预算 resize（`image_processor.py`）**
+`max_n_token=384` 硬预算 + 解析式反解宽高 + `safe_resize` 循环递减每张图的 LLM token 开销被压在 384，且是解析解不是搜索。对性能的意义：**图像 token 数直接决定 prefill 计算量**，这是视觉 RL rollout 里最大的可变成本项；对比不设上限的 naive resize，长宽比极端的图最多可省数倍 token。
+
+**7. processor 的 N-layout + 4-token 压缩对齐**
+compress pad 对齐 4、奇数行补 pad、`perm` 展平置换——让视觉 token 在 LLM 侧按对齐器期望的交错行序排布，配合后续 kernel 的向量化访问，属于为硬件友好布局做的设计。
+
+## 三、稳定性/防挂 → 保性能（不产生加速，但避免性能归零）
+
+**8. transformer-engine-npu `0001-empty-tokenemm`**
+M=0 时跳过 aclnnGroupedMatmulV5（该算子在空 token + 非连续 view 下必崩）。意义：使能 **空 microbatch / 动态 batch** 场景，避免一次 crash  step 作废。
+
+**9. mindspeed-bridge `embedding_gradient_accumulation_wrapper`**
+修的是 F/B overlap 下 embedding 首个 microbatch 归约全零梯度的 bug——不修的话不是慢，是训练 silently 错。
+
+**10. megatron-lm `0001-skip-unavailable-async-checkpoint`**
+放行的不是性能，是 **nvrx 异步 checkpoint 路径**本身（NPU 装不到 nvidia-resili-ext）。异步 checkpoint 对长训练的意义：保存不阻塞训练，step time 不毛刺。
+
+## 四、观测性（定位性能问题的工具，本身不加速）
+
+**11. mindspeed-bridge `router.py` 的 `V4_LOG_EXPERT_LOAD=1`**
+打印每层 per-expert token 计数（min/mean/max/std/max÷mean）。负载均衡是 MoE 性能的第一变量，这个开关是全套里唯一的性能分析工具——你之前做热点专家分析，正路就是开这个日志而不是离线 dump topk_ids。
+
+## 五、明确不属于性能类的
+
+- verl 的 `_build_dsv4_images_from_mm`、Vision Bridge 校验、agent_loop 折叠、tokenizer 直连加载 —— 纯正确性
+ vllm-ascend 0001（跳过缺失参数）、0004（识别预展开 prompt）—— 纯正确性/兼容性
+- processor `0001-checkpoint-serialization` —— 工程便利
+- vllm-end 0003 `DSV4_FORCE_MOE_ALLTOALL` —— 看着像性能开关，实际是**训推通信路径对齐**（保证 rollout 和训练走同一条 dispatch 路径），速度上 alltoall vs mc2 谁快取决于负载，别当性能优化用
+
+**一句话总结**：真正"为快而打"的是 **vllm-ascend 0002（视觉塔融合算子）+ mindspeed-bridge 的 mHC 融合与 wgrad 选择**；真正"省而设计"的是 **verl 零拷贝布局还原 + processor 的 384 token 预算**；`moe_fb_overlap` 是最诱人的吞吐选项但有 checkpoint 兼容性代价。
+
