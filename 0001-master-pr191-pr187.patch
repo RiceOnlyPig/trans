@@ -1,0 +1,1669 @@
+diff --git a/mindspeed_bridge/features/feature_list.py b/mindspeed_bridge/features/feature_list.py
+index d3172f6..ef83323 100644
+--- a/mindspeed_bridge/features/feature_list.py
++++ b/mindspeed_bridge/features/feature_list.py
+@@ -9,15 +9,16 @@ from mindspeed.features_manager.moe.moe_alltoall_overlap import MoEAlltoAllOverL
+ from mindspeed.features_manager.optimizer.swap_optimizer_feature import SwapOptimizerFeature
+ from mindspeed.features_manager.tensor_parallel.mc2 import MC2Feature
+ from mindspeed.features_manager.transformer.flash_attention.fusion_attention_v1_feature import FusionAttentionFeature
+-from mindspeed.features_manager.moe.fb_overlap import MoEFwdBwdOverlapFeature
+ 
+ from mindspeed_bridge.features.data.vlm_datasets.shuffle_control import PreloadedVLMShuffleControlFeature
+ from mindspeed_bridge.features.megatron.glm.dsa_index_share_recompute import DSAIndexShareRecomputeFeature
+ from mindspeed_bridge.features.megatron.glm.dsa_indexer_loss_scale import DSAIndexerLossScaleFeature
+ from mindspeed_bridge.features.megatron.common.fast_multi_tensor_scale import FastMultiTensorScaleFeature
++from mindspeed_bridge.features.megatron.deepseek_v4_flash.moe_fb_overlap import MoEFwdBwdOverlapFeature
+ from mindspeed_bridge.features.megatron.qwen_vl.gdn import GDNFeature
+ from mindspeed_bridge.features.megatron.glm.dsa import GLMDSAFeature
+ from mindspeed_bridge.features.megatron.hy_v4.dsa import Hy4DSAFeature
++from mindspeed_bridge.features.megatron.deepseek_v4_flash.mhc import DeepSeekV4FlashMHCFeature
+ from mindspeed_bridge.features.megatron.glm_vl.mhc import MHCFeature
+ from mindspeed_bridge.features.megatron.common.optimize_send_recv_comm import OptimizeSendRecvCommFeature
+ from mindspeed_bridge.features.megatron.common.packed_pipeline_communication import PackedPipelineCommunicationFeature
+@@ -43,7 +44,6 @@ def create_mindspeed_features_list() -> list:
+         FusionAttentionFeature(),
+         # MoE alltoall compute/communication overlap, mounted directly.
+         MoEAlltoAllOverLapFeature(),
+-        MoEFwdBwdOverlapFeature(),
+     ]
+ 
+ 
+@@ -55,6 +55,8 @@ def create_bridge_features_list() -> list:
+         GLM53FlashMTPSpecFeature(),
+         Hy4DSAFeature(),
+         FastMultiTensorScaleFeature(),
++        # MindSpeed MoE forward/backward overlap, with the Bridge-side shims.
++        MoEFwdBwdOverlapFeature(),
+         MoEPermuteMaskedSelectFeature(),
+         FusedMLARopeFeature(),
+         DSv4TextSwiGLUFeature(),
+@@ -68,6 +70,7 @@ def create_bridge_features_list() -> list:
+         DSAIndexerLossScaleFeature(),
+         OptimizeSendRecvCommFeature(),
+         MHCFeature(),
++        DeepSeekV4FlashMHCFeature(),
+         Qwen3ASRAutoConfigFeature(),
+         TESafeGlobalsFeature(),
+         MindSpeedGPTProviderConfigFeature(),
+diff --git a/mindspeed_bridge/features/megatron/deepseek_v4_flash/__init__.py b/mindspeed_bridge/features/megatron/deepseek_v4_flash/__init__.py
+index e5040ca..44b7f02 100644
+--- a/mindspeed_bridge/features/megatron/deepseek_v4_flash/__init__.py
++++ b/mindspeed_bridge/features/megatron/deepseek_v4_flash/__init__.py
+@@ -5,4 +5,8 @@
+ 
+ The fused kernels stay in the model package (``<op>_fused.py``); the patches that
+ route Megatron's shared modules through them are registered from here.
++The text core is what carries the mHC and MoE machinery these features switch,
++and the vision unit extends that core (its provider subclasses the text
++provider), so a feature here serves both the text and the VL runs -- which is
++why this directory is named after the core rather than after one of the units.
+ """
+diff --git a/mindspeed_bridge/features/megatron/deepseek_v4_flash/mhc.py b/mindspeed_bridge/features/megatron/deepseek_v4_flash/mhc.py
+new file mode 100644
+index 0000000..f69a6b6
+--- /dev/null
++++ b/mindspeed_bridge/features/megatron/deepseek_v4_flash/mhc.py
+@@ -0,0 +1,70 @@
++# Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0.
++"""DeepSeek-V4-Flash mHC switches that only this stack has.
++
++The shared mHC switch names (``--enable-mhc``, ``--hc-mult``, ``--hc-eps``,
++``--hc-sinkhorn-iters``, ``--use-fused-mhc``) are registered by the GLM mHC
++feature; they are the MindSpeed/verl spellings and every mHC model answers to
++the same ones.  This feature adds only what is DSv4's own, so the GLM file stays
++a GLM file.
++
++It deliberately does *not* subclass that feature: ``register_args`` there would
++register the shared options a second time, and argparse refuses a duplicate
++option string.  Registering only the new switch keeps the two features
++independent -- this one can be dropped without touching GLM, and GLM's can
++change its patches without touching DSv4.
++"""
++
++from __future__ import annotations
++
++import argparse
++
++from megatron_adaptor.features_manager.mindspeed_feature import MindSpeedFeature
++
++from mindspeed_bridge.features.adaptor import get_bridge_model_config
++
++
++class DeepSeekV4FlashMHCFeature(MindSpeedFeature):
++    """The DSv4-only mHC switch: the split form of the fused pre step."""
++
++    def __init__(self):
++        super().__init__(feature_name="dsv4_flash_mhc", optimization_level=0)
++
++    def register_args(self, parser: argparse.ArgumentParser):
++        """Expose the DSv4 mHC switch on the unified CLI.
++
++        A VERL launch reaches Bridge through the shell command line, so a knob it
++        may pass has to be registered here.  The default stays neutral: only an
++        option actually present on the command line is translated onto the
++        provider in :meth:`validate_args`.
++        """
++        group = parser.add_argument_group(title=self.feature_name)
++        group.add_argument(
++            "--use-fused-split-mhc-pre",
++            action="store_true",
++            default=False,
++            help="run the fused mHC pre step as separate mhc_pre and mhc_sinkhorn operators; "
++            "requires --use-fused-mhc.",
++        )
++
++    def validate_args(self, args):
++        """Refuse the switch on its own and translate it onto the provider.
++
++        The split switch picks *how* the fused pre step runs and does nothing to
++        the eager chain, so on its own it would silently have no effect; refuse it
++        the way the MindSpeed-LLM side does.  The provider repeats the check for
++        the config-field spelling (``model.use_fused_split_mhc_pre``), which is
++        the path a Bridge recipe takes.
++        """
++        if getattr(args, "use_fused_split_mhc_pre", False) and not getattr(args, "use_fused_mhc", False):
++            raise ValueError("--use-fused-split-mhc-pre requires --use-fused-mhc.")
++        explicit = getattr(args, "_explicit_feature_args", ()) or ()
++        config = get_bridge_model_config(args)
++        if config is None:
++            return
++        if "use_fused_split_mhc_pre" in explicit:
++            config.use_fused_split_mhc_pre = bool(args.use_fused_split_mhc_pre)
++
++
++__all__ = ["DeepSeekV4FlashMHCFeature"]
+diff --git a/mindspeed_bridge/features/megatron/deepseek_v4_flash/moe_fb_overlap.py b/mindspeed_bridge/features/megatron/deepseek_v4_flash/moe_fb_overlap.py
+new file mode 100644
+index 0000000..b350e9e
+--- /dev/null
++++ b/mindspeed_bridge/features/megatron/deepseek_v4_flash/moe_fb_overlap.py
+@@ -0,0 +1,463 @@
++# Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0.
++"""DeepSeek-V4-Flash integration for MindSpeed's MoE forward/backward overlap.
++
++Scoped to this stack rather than kept as a common feature: what it supplies are
++the things MindSpeed assumes and *this* model does not provide the way it
++expects -- DSv4's hyper connections need their own staging adapter, its clamped
++SwiGLU needs the staged experts' check relaxed, and its hash router has to
++survive their MoE layer.  Another model wanting the overlap would need its own
++answers to the same questions, not these.
++
++MindSpeed owns the schedule: it rebinds ``TransformerBlock.forward`` and every
++layer's ``forward`` to a staged implementation, replaces the MoE spec with its
++grouped experts, and interleaves microbatch *i*'s forward with microbatch
++*i-1*'s backward (at PP=1 through ``forward_backward_no_pipelining``).  This
++module supplies only what MindSpeed assumes but Bridge does not provide:
++
++* ``extra_block_kwargs`` routing.  MindSpeed hands the backward state to the
++  model as a forward kwarg; vanilla MCore ``GPTModel.forward`` has no such
++  parameter, so it is injected into the decoder call instead.
++* wgrad fusion.  MindSpeed defers expert wgrad to ``WeightGradStore`` and reads
++  one global flag to decide whether to use the fused kernel, but Bridge lets
++  each Linear decide; the producing Linear's choice is carried on the weight.
++* embedding gradients, which must not be accumulated out of a zeroed main-grad
++  buffer once DDP's post-hooks are rewired.
++* shared experts, whose MindSpeed implementation reads ``n_shared_experts`` --
++  a MindSpeed-LLM name that Bridge's provider does not define.
++
++Everything here is gated on ``moe_fb_overlap`` and is a no-op otherwise, so the
++feature stays mounted for every model.  Models with their own layer structure
++(hyper connections, for instance) need their own staging adapter on top of
++this; such a model must refuse the flag until that adapter exists.
++"""
++
++from __future__ import annotations
++
++import logging
++import sys
++
++from dataclasses import replace
++from functools import wraps
++from inspect import signature
++from typing import Any
++
++import torch
++
++from mindspeed.features_manager.moe.fb_overlap import (
++    MoEFwdBwdOverlapFeature as MindSpeedMoEFwdBwdOverlapFeature,
++)
++
++from mindspeed_bridge.features.adaptor import get_bridge_model_config
++
++logger = logging.getLogger(__name__)
++
++# Set on a weight by the Linear that produced it, read when its delayed wgrad
++# finally runs inside MindSpeed's WeightGradStore.
++_FB_WGRAD_FUSION_ATTR = "_mindspeed_bridge_fb_gradient_accumulation_fusion"
++
++
++class MoEFwdBwdOverlapFeature(MindSpeedMoEFwdBwdOverlapFeature):
++    """MindSpeed F/B overlap with the Bridge-side compatibility patches."""
++
++    def validate_args(self, args):
++        super().validate_args(args)
++        if not getattr(args, "moe_fb_overlap", False):
++            return
++
++        config = get_bridge_model_config(args)
++        if config is not None:
++            sync_mindspeed_config(config)
++            # MindSpeed's staged forward reads args.enable_mhc to decide whether
++            # to drive the hyper-connection stages; Bridge models name the same
++            # thing on the config, so publish it here.
++            if bool(getattr(config, "enable_mhc_connections", False)):
++                args.enable_mhc = True
++                args.hc_mult = int(getattr(config, "mhc_num_residual_streams", 1) or 1)
++
++    def register_patches(self, patch_manager, args):
++        super().register_patches(patch_manager, args)
++        if not getattr(args, "moe_fb_overlap", False):
++            return
++
++        # Hyper connections: MindSpeed's staged forward drives them through a
++        # two-stage protocol that each model's own layer has to implement, so
++        # the adapter is registered per model.  Registered after the super()
++        # call above, which means it wraps MindSpeed's block __init__ from the
++        # outside and sees the staged forwards it installed.
++        config = get_bridge_model_config(args)
++        if config is not None and bool(getattr(config, "enable_mhc_connections", False)):
++            from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash.mhc_fb_overlap import (
++                register_dsv4_mhc_fb_overlap_patch,
++            )
++
++            register_dsv4_mhc_fb_overlap_patch(patch_manager)
++
++        patches = (
++            (
++                "megatron.core.models.gpt.gpt_model.GPTModel.forward",
++                gpt_model_fb_overlap_forward_wrapper,
++            ),
++            (
++                "megatron.core.tensor_parallel.layers.LinearWithGradAccumulationAndAsyncCommunication.backward",
++                cache_linear_gradient_accumulation_fusion_wrapper,
++            ),
++            (
++                "megatron.core.tensor_parallel.layers.VocabParallelEmbedding.__init__",
++                embedding_gradient_accumulation_wrapper,
++            ),
++            (
++                "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules."
++                "weight_grad_store.WeightGradStore.overlap_matmul",
++                weight_grad_store_overlap_matmul_wrapper,
++            ),
++            (
++                "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.shared_experts."
++                "SharedExpertMLPFbOverlap.__init__",
++                shared_expert_mcore_linears_wrapper,
++            ),
++            (
++                "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.experts."
++                "MindSpeedFbOverlapGmmExperts._validate_fb_overlap_config",
++                experts_allow_clamped_glu_wrapper,
++            ),
++            (
++                "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.moe_layer."
++                "MindSpeedFbOverlapMoELayer.__init__",
++                moe_layer_spec_router_wrapper,
++            ),
++        )
++        for target, wrapper in patches:
++            patch_manager.register_patch(target, wrapper)
++
++
++def moe_layer_spec_router_wrapper(original):
++    """Build the *spec's* router in MindSpeed's F/B-overlap MoE layer.
++
++    Its ``__init__`` hardcodes ``self.router = TopKRouter(...)`` instead of
++    reading ``submodules.router``, which assumes a router whose behaviour the
++    config can reconstruct in full.  That holds for a model whose routing is
++    config-expressed -- a score function, a top-k, an expert bias -- and not for
++    one whose routing lives in a subclass: DSv4's first layers do not score at
++    all, they look the expert ids up in a ``tid2eid`` table, which
++    ``Dsv4HashRouter`` implements by overriding ``routing``.  The table is a
++    buffer on that subclass, so the stock router is also no home for the
++    checkpoint's ``ffn.gate.tid2eid`` weights: left alone, a run that loads real
++    weights would find no destination for the table and would score where the
++    checkpoint says look up -- silently, because scoring is also the legitimate
++    path for a checkpoint that ships no table.
++
++    MindSpeed's own ``replace`` of the submodules keeps the router slot (it swaps
++    only experts and shared_experts), so the spec's class is still there to be
++    used; this reads as a missed line rather than a decision.
++
++    Rather than rebuild the router afterwards -- which would construct one
++    throwaway module and consume an extra round of init RNG, shifting the
++    initialisation of everything after it -- the module-global name their line
++    resolves is rebound to the slot's class for the duration of the call, so
++    *their* construction builds *our* router with exactly their arguments.
++    Model construction is single-threaded and the name is restored in a finally,
++    so nothing else observes the swap.
++
++    A no-op for a spec whose slot is the stock router, which is every other
++    model in the tree.
++    """
++
++    @wraps(original)
++    def init_with_spec_router(self, config, submodules=None, *args, **kwargs):
++        slot = getattr(submodules, "router", None)
++        module = sys.modules.get(original.__module__)
++        stock = getattr(module, "TopKRouter", None) if module is not None else None
++        usable = (
++            slot is not None
++            and stock is not None
++            and slot is not stock
++            and isinstance(slot, type)
++            and issubclass(slot, stock)
++        )
++        if not usable:
++            return original(self, config, submodules, *args, **kwargs)
++        module.TopKRouter = slot
++        try:
++            result = original(self, config, submodules, *args, **kwargs)
++        finally:
++            module.TopKRouter = stock
++        # Said once per process: the only positive evidence in the log that the
++        # overlapped layers kept the model's own router rather than the stock one.
++        if not getattr(init_with_spec_router, "_announced", False):
++            init_with_spec_router._announced = True
++            logger.info(
++                "dsv4 fb overlap: MindSpeed's MoE layer builds the spec's router (%s), not the stock %s",
++                slot.__name__,
++                stock.__name__,
++            )
++        return result
++
++    return init_with_spec_router
++
++
++def experts_allow_clamped_glu_wrapper(original):
++    """Let MindSpeed's staged experts run a clamped GLU that the model supplies.
++
++    They reject ``activation_func_clamp_value`` outright, because neither of
++    their own activation arms applies it -- a correct refusal in general, since
++    the alternative is dropping a clamp the checkpoint declares.  It stops being
++    correct once the model has routed its fused activation through a clamp-aware
++    implementation *in this very module*: the model's SwiGLU patch replaces
++    ``weighted_bias_swiglu_impl`` here, and for DSv4 that replacement is the CANN
++    clipped SwiGLU, so the clamp is represented and the rejection no longer
++    holds.  The marker below is what distinguishes the two cases; without it the
++    rejection stands.
++
++    The config value is hidden only for the duration of their check -- every
++    other rejection in it still runs.
++    """
++
++    @wraps(original)
++    def validate_with_clamped_glu(self, *args, **kwargs):
++        clamp = getattr(self.config, "activation_func_clamp_value", None)
++        if clamp is None or not _clamped_glu_installed(type(self)):
++            return original(self, *args, **kwargs)
++        self.config.activation_func_clamp_value = None
++        try:
++            return original(self, *args, **kwargs)
++        finally:
++            self.config.activation_func_clamp_value = clamp
++
++    return validate_with_clamped_glu
++
++
++def _clamped_glu_installed(experts_class) -> bool:
++    """True when the staged experts' fused activation carries the model's clamp.
++
++    The marker is set by the model's own SwiGLU patch when it replaces
++    ``weighted_bias_swiglu_impl`` in MindSpeed's experts module.  Absent -- a
++    tree whose fused SwiGLU does not reach into this module, or a run with the
++    fusion off -- the staged experts would silently compute an unclamped GLU, so
++    the rejection must stand.
++    """
++    module = sys.modules.get(experts_class.__module__)
++    impl = getattr(module, "weighted_bias_swiglu_impl", None)
++    return bool(getattr(impl, "_bridge_applies_activation_clamp", False))
++
++
++def gpt_model_fb_overlap_forward_wrapper(original):
++    """Route MindSpeed's ``extra_block_kwargs`` through vanilla MCore GPTModel.
++
++    MindSpeed's schedule binds the kwarg onto the outermost model's forward, so
++    it arrives here through the wrappers (DDP, Float16Module and, for a VLM, the
++    multimodal model that forwards ``**kwargs`` to its language model).  MCore
++    v0.18's GPTModel does not accept it, so it is handed to the decoder -- the
++    block whose forward MindSpeed replaced -- for the duration of the call.
++    The layer graphs travel back out through the block itself
++    (``block.get_fwd_layer_graphs()``), not through this return value.
++    """
++    if getattr(original, "_mindspeed_bridge_fb_overlap_extra_kwargs", False):
++        return original
++    original_parameters = signature(original).parameters
++
++    @wraps(original)
++    def forward_with_fb_overlap_kwargs(self, *args, extra_block_kwargs=None, **kwargs):
++        if "extra_block_kwargs" in original_parameters:
++            return original(self, *args, extra_block_kwargs=extra_block_kwargs, **kwargs)
++        if not extra_block_kwargs:
++            return original(self, *args, **kwargs)
++        decoder = self.decoder
++        original_decoder_forward = decoder.forward
++
++        @wraps(original_decoder_forward)
++        def decoder_forward_with_fb_overlap_kwargs(*decoder_args, **decoder_kwargs):
++            decoder_kwargs.update(extra_block_kwargs)
++            return original_decoder_forward(*decoder_args, **decoder_kwargs)
++
++        decoder.forward = decoder_forward_with_fb_overlap_kwargs
++        try:
++            return original(self, *args, **kwargs)
++        finally:
++            decoder.forward = original_decoder_forward
++
++    forward_with_fb_overlap_kwargs._mindspeed_bridge_fb_overlap_extra_kwargs = True
++    forward_with_fb_overlap_kwargs._mindspeed_bridge_original = original
++    return forward_with_fb_overlap_kwargs
++
++
++def cache_linear_gradient_accumulation_fusion_wrapper(original):
++    """Record, on the weight, whether its Linear chose the fused wgrad kernel."""
++
++    @wraps(original)
++    def backward_with_cached_fusion(ctx, grad_output):
++        _, weight = ctx.saved_tensors
++        setattr(weight, _FB_WGRAD_FUSION_ATTR, bool(ctx.gradient_accumulation_fusion))
++        return original(ctx, grad_output)
++
++    return backward_with_cached_fusion
++
++
++def weight_grad_store_overlap_matmul_wrapper(original):
++    """Run the delayed wgrad with the producing Linear's fusion choice.
++
++    MindSpeed's own implementation consults the global
++    ``args.gradient_accumulation_fusion``; under Bridge a Linear may have been
++    built with the fusion off (no ``main_grad`` to accumulate into), and using
++    the fused kernel for it corrupts the gradient.  Grouped (``gmm_weight``)
++    and unmarked weights keep MindSpeed's path.
++    """
++
++    @wraps(original)
++    def overlap_matmul_with_cached_fusion(*call_args):
++        # ``WeightGradStore.overlap_matmul`` is a classmethod, and the patch
++        # manager hands wrappers the *unbound* function before re-applying the
++        # descriptor -- so the call arrives as (cls, cache).  Taking the cache
++        # off the end also covers a MindSpeed build that declares it static.
++        grad_store_cache = call_args[-1]
++        total_input, grad_output, weight, _sequence_parallel, _in_row = grad_store_cache
++        if hasattr(weight, "gmm_weight") or not hasattr(weight, _FB_WGRAD_FUSION_ATTR):
++            return original(*call_args)
++        if len(grad_output.shape) > 2:
++            grad_output = grad_output.contiguous()
++            sb = grad_output.shape[0] * grad_output.shape[1]
++            grad_output = grad_output.view(sb, grad_output.shape[2])
++            total_input = total_input.view(sb, total_input.shape[2])
++        if getattr(weight, _FB_WGRAD_FUSION_ATTR):
++            import fused_weight_gradient_mlp_cuda
++
++            if weight.main_grad.dtype == torch.float32:
++                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, weight.main_grad)
++            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
++                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, weight.main_grad)
++            else:
++                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
++        else:
++            grad_weight = grad_output.t().matmul(total_input)
++            weight.main_grad.data.add_(grad_weight)
++        total_input.untyped_storage().resize_(0)
++        grad_output.untyped_storage().resize_(0)
++        return None
++
++    return overlap_matmul_with_cached_fusion
++
++
++def embedding_gradient_accumulation_wrapper(original):
++    """Accumulate embedding gradients without reading a zeroed main-grad buffer.
++
++    F/B overlap rewires DDP's backward post-hooks, which is where the embedding
++    weight's ``main_grad`` would normally be filled; add the gradient here so
++    the first microbatch does not reduce a buffer of zeros.
++    """
++
++    @wraps(original)
++    def init_with_gradient_accumulation(self, *args, **kwargs):
++        original(self, *args, **kwargs)
++        config = kwargs.get("config")
++        if config is None or not getattr(config, "gradient_accumulation_fusion", False):
++            return
++        weight = self.weight
++
++        def accumulate_embedding_grad(grad):
++            if not hasattr(weight, "main_grad") or not hasattr(weight, "grad_added_to_main_grad"):
++                return grad
++            if getattr(weight, "zero_out_wgrad", False):
++                return grad
++            if weight.grad_added_to_main_grad:
++                weight.main_grad.add_(grad)
++            else:
++                weight.main_grad.copy_(grad)
++                weight.grad_added_to_main_grad = True
++            return grad
++
++        weight.register_hook(accumulate_embedding_grad)
++
++    return init_with_gradient_accumulation
++
++
++def shared_expert_mcore_linears_wrapper(original):
++    """Build MindSpeed's F/B-overlap shared expert on MCore linears.
++
++    Its thin staged forward calls ``linear_fc1`` / ``linear_fc2`` directly and
++    does not drive a Transformer Engine module's own backward bookkeeping.
++    """
++
++    @wraps(original)
++    def wrapper(self, config, submodules, gate, *args, **kwargs):
++        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
++
++        submodules = replace(submodules, linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear)
++        return original(self, config, submodules, gate, *args, **kwargs)
++
++    return wrapper
++
++
++def sync_shared_expert_config(config: Any) -> None:
++    """Publish MindSpeed-LLM's shared-expert names from the Bridge provider.
++
++    MindSpeed's shared expert reads ``n_shared_experts``; Bridge configures the
++    same thing as ``moe_shared_expert_intermediate_size``.  Derive one from the
++    other and reject a pair that disagrees, rather than silently building a
++    shared expert of a different width than the checkpoint declares.
++    """
++    expert_size = getattr(config, "moe_ffn_hidden_size", None)
++    if expert_size is None:
++        expert_size = getattr(config, "ffn_hidden_size", None)
++
++    shared_size = getattr(config, "moe_shared_expert_intermediate_size", None)
++    shared_experts = getattr(config, "n_shared_experts", None)
++    if shared_experts is not None:
++        shared_experts = int(shared_experts)
++        if shared_experts <= 0:
++            raise ValueError(f"n_shared_experts must be positive, got {shared_experts}")
++
++    if shared_size is not None:
++        if not expert_size:
++            raise ValueError(
++                "moe_ffn_hidden_size/ffn_hidden_size must be configured when moe_shared_expert_intermediate_size is set"
++            )
++        shared_size = int(shared_size)
++        expert_size = int(expert_size)
++        if shared_size % expert_size:
++            raise ValueError(
++                "moe_shared_expert_intermediate_size must be divisible by the per-expert FFN hidden size: "
++                f"shared_size={shared_size}, expert_ffn_size={expert_size}"
++            )
++        derived_shared_experts = shared_size // expert_size
++        if shared_experts is None:
++            shared_experts = derived_shared_experts
++        elif shared_experts != derived_shared_experts:
++            raise ValueError(
++                "n_shared_experts is inconsistent with moe_shared_expert_intermediate_size: "
++                f"n_shared_experts={shared_experts}, derived={derived_shared_experts}"
++            )
++    elif shared_experts is not None:
++        if not expert_size:
++            raise ValueError("moe_ffn_hidden_size/ffn_hidden_size must be configured when n_shared_experts is set")
++        config.moe_shared_expert_intermediate_size = shared_experts * int(expert_size)
++
++    config.n_shared_experts = shared_experts
++    config.shared_expert_gate = bool(
++        getattr(config, "moe_shared_expert_gate", getattr(config, "shared_expert_gate", False))
++    )
++
++
++def sync_mindspeed_config(config: Any) -> None:
++    """Publish every MindSpeed-side name F/B overlap reads off the config."""
++    sync_shared_expert_config(config)
++    # MindSpeed's staged experts call their own activation path and reject
++    # Transformer Engine's fused activation backend.
++    config.use_te_activation_func = False
++    # The staged backward is only reachable through the
++    # ``deallocate_pipeline_outputs`` branch of MindSpeed's backward_step; with
++    # the MCore default (False) it instead calls autograd on the loss with the
++    # block's input gradient and fails on the shape mismatch.  This is a
++    # requirement of the schedule, not a tuning choice.
++    if not getattr(config, "deallocate_pipeline_outputs", False):
++        config.deallocate_pipeline_outputs = True
++    config.coc_fused_kernel = bool(getattr(config, "coc_fused_kernel", False))
++    config.coc_row_nocomm = config.coc_fused_kernel
++
++
++__all__ = [
++    "MoEFwdBwdOverlapFeature",
++    "gpt_model_fb_overlap_forward_wrapper",
++    "shared_expert_mcore_linears_wrapper",
++    "sync_mindspeed_config",
++]
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/deepseek_v4_flash_provider.py b/mindspeed_bridge/models/deepseek_v4_flash/deepseek_v4_flash_provider.py
+index 6a037cb..c6b056e 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/deepseek_v4_flash_provider.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/deepseek_v4_flash_provider.py
+@@ -160,6 +160,14 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+     # Off by default: the ST case turns it on through its `USE_FUSED_MOE_PERMUTE`
+     # parameter, so the fused arm is the one the recorded baseline guards.
+     use_fused_moe_permute: bool = False
++    # Run the fused mHC pre step as its two operators: ``mhc_pre`` (projection +
++    # norm + stream split) followed by ``mhc_sinkhorn``.  That is the only fused
++    # pre the Ascend arm offers, so without this switch ``use_fused_mhc`` fuses
++    # the post step alone and the pre keeps its eager chain.  Needs a
++    # cann_ops_transformer that ships those two operators.
++    # CLI: ``model.use_fused_split_mhc_pre=true``, or ``--use-fused-split-mhc-pre``
++    # together with ``--use-fused-mhc`` on the MindSpeed-style command line.
++    use_fused_split_mhc_pre: bool = False
+     # Context parallelism algorithm.  "" keeps the historical behaviour
+     # (context_parallel_size must be 1).  "kvallgather_cp_algo" enables the
+     # prefix-KV scheme used by the vendored reference: every rank keeps its own
+@@ -176,6 +184,27 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+     fused_rope_mode: str = "interleave"
+     use_fused_swiglu: bool = True
+     use_fused_gmm: bool = False
++    # ------------------------------------------------------------------
++    # MoE forward/backward overlap (MindSpeed's ``--moe-fb-overlap``, wired by
++    # features/megatron/deepseek_v4_flash/moe_fb_overlap.py).  MindSpeed interleaves
++    # microbatch i's forward with microbatch i-1's backward, so it needs at
++    # least two microbatches per rank -- at one microbatch the overlap loop
++    # never runs and the feature is pure overhead.
++    #
++    # Turning it on hands the MoE layer to MindSpeed: it replaces the module
++    # spec with its own grouped experts and rebinds every layer's forward to a
++    # staged implementation.  ``moe_grouped_gemm`` therefore has to be on for
++    # MindSpeed to find the grouped submodules (handled in ``finalize``), and
++    # that grouped layout does not match the bridge's per-expert HF weight
++    # mapping, so this is for throughput work, not for a run that loads or
++    # saves a checkpoint.
++    #
++    # mHC rides along: the staging adapter in ``mhc_fb_overlap.py`` maps DSv4's
++    # hyper connections onto the two-stage protocol MindSpeed's staged forward
++    # drives, and restores the block's entry expansion / exit contraction that
++    # the replaced block forward would otherwise skip.
++    # ------------------------------------------------------------------
++    moe_fb_overlap: bool = False
+ 
+     def finalize(self) -> None:
+         # core_v0.18.0 predates the DSv4 config checks and the MLA derivation;
+@@ -198,6 +227,15 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+         activate_dsv4_mhc_block()
+         activate_dsv4_mtp_support()
+ 
++        # Development probe, off unless DSV4_LOG_EXPERT_LOAD=1 (see router.py):
++        # logs the per-expert token counts, the only direct evidence of whether
++        # the routing is balanced.
++        from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash.router import (  # pylint: disable=import-outside-toplevel
++            install_expert_load_logging,
++        )
++
++        install_expert_load_logging()
++
+         # MindSpeed's feature patches (selected by enable_hyper_connections)
+         # land after the recipe ran and install the GLM mHC pipeline shape
+         # exchange; restore mcore's three-dimensional exchange for the DSv4
+@@ -251,9 +289,37 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+         # pylint: disable=attribute-defined-outside-init
+         self.apply_dsa_kernel_fusion = False
+         self.apply_rope_fusion = False
++        # mHC: keep the caller's setting and only force it off when this build
++        # ships no mHC operators.  With no Ascend arm, ``use_fused_mhc=True`` used
++        # to import the CUDA/Blackwell-only
++        # ``megatron.core.fusions.fused_mhc_kernels``, which the pinned mcore does
++        # not have; it now routes to the CANN operators in mhc_fused.py.
++        self.use_fused_mhc = bool(self.use_fused_mhc) and mhc_fused.fused_available()
++        # Split pre arm: it chooses how the fused pre step runs, so it cannot
++        # stand on its own, and the two operators it needs ship separately from
++        # ``mhc_post``.  Both conditions are refused here, at config time, rather
++        # than at the first forward -- a throughput run that silently kept the
++        # eager pre would be reported as the split arm's number.
++        if self.use_fused_split_mhc_pre:
++            if not self.use_fused_mhc:
++                raise ValueError(
++                    "model.use_fused_split_mhc_pre requires model.use_fused_mhc=true: it selects how "
++                    "the fused mHC pre step runs and has no effect on the eager chain."
++                )
++            if not mhc_fused.split_available():
++                raise ValueError(
++                    "model.use_fused_split_mhc_pre needs a cann_ops_transformer providing mhc_pre and "
++                    "mhc_sinkhorn; this build does not ship them. Point the run at a package that "
++                    "carries the split operators, or leave the switch off."
++                )
++        mhc_fused.set_fused_enabled(self.use_fused_mhc)
++        mhc_fused.set_split_enabled(self.use_fused_split_mhc_pre)
+         self.dsa_indexer_loss_coeff = 0.0
+         self.dsa_indexer_use_sparse_loss = False
+-        self.moe_grouped_gemm = False
++        # Normally pinned off: the grouped layout breaks the SequentialExperts
++        # HF mapping.  F/B overlap is the one path that needs it on, because
++        # MindSpeed locates its staged experts through the grouped submodules.
++        self.moe_grouped_gemm = bool(self.moe_fb_overlap)
+         self.gemm_gradient_accumulation_fusion = False
+         self.moe_token_dispatcher_type = "alltoall"  # nosec B105
+         self.moe_router_load_balancing_type = "none"
+@@ -265,6 +331,37 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+         # CLI override has landed (this is the only writer of the module flags).
+         self._apply_text_fused_switches()
+ 
++        # MindSpeed owns the MoE layer and every layer forward once F/B overlap
++        # is on, so the combinations it cannot reproduce are refused outright
++        # rather than silently building a different model.
++        if self.moe_fb_overlap:
++            if self.mtp_num_layers:
++                raise ValueError(
++                    "model.moe_fb_overlap does not support MTP on DSv4 yet "
++                    f"(mtp_num_layers={self.mtp_num_layers}); set model.mtp_num_layers=0."
++                )
++            # The checkpoint declares swiglu_limit, which the bridge copies into
++            # activation_func_clamp_value; neither of MindSpeed's staged expert
++            # activation arms applies it, and their own check rejects it deep
++            # inside layer construction.  Say so here, where the switch is.
++            #
++            # The clamp does survive the overlapped path when the model has
++            # routed its fused activation through a clamp-aware implementation
++            # installed into MindSpeed's experts module -- for DSv4 that is the
++            # CANN clipped SwiGLU of the fused-operator work, which is what
++            # ``experts_allow_clamped_glu_wrapper`` then lets through.  Only
++            # refuse when that is *not* going to be there: either the switch is
++            # off, or this tree does not carry the fused SwiGLU module at all.
++            clamp_value = getattr(self, "activation_func_clamp_value", None)
++            if clamp_value is not None and not self._clamped_glu_will_be_fused():
++                raise ValueError(
++                    "model.moe_fb_overlap cannot reproduce the SwiGLU clamp this checkpoint declares "
++                    f"(activation_func_clamp_value={clamp_value}) without a clamp-aware fused "
++                    "activation: MindSpeed's staged grouped experts have no clamped arm and would drop "
++                    "it. Set model.use_fused_swiglu=true (needs the CANN clipped SwiGLU kernels), or "
++                    "model.activation_func_clamp_value=null to measure throughput without the clamp."
++                )
++
+     def _apply_text_fused_switches(self) -> None:
+         """Push every text-side fusion switch into its kernel module.
+ 
+@@ -316,6 +413,29 @@ class DeepSeekV4FlashModelProvider(MLAModelProvider):
+             # pylint: disable=attribute-defined-outside-init
+             self.bias_activation_fusion = True
+ 
++    def _clamped_glu_will_be_fused(self) -> bool:
++        """Whether the clamp will ride inside a fused activation on this build.
++
++        Written tolerantly on purpose: the clamp-aware activation is the fused
++        clipped SwiGLU, which lives in the fused-operator module
++        (``modelling_deepseek_v4_flash.swiglu_fused``).  A tree without that
++        module -- this branch on its own -- has no way to represent the clamp
++        under the overlapped path, so the answer is False and the caller
++        refuses, exactly as before.  With the module present, the answer tracks
++        the switch and the kernels' availability, and the clamp is allowed
++        through.
++        """
++        if not getattr(self, "use_fused_swiglu", False):
++            return False
++        try:
++            from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash import (  # pylint: disable=import-outside-toplevel
++                swiglu_fused,
++            )
++        except ImportError:
++            return False
++        clipped_available = getattr(swiglu_fused, "clipped_available", None)
++        return bool(clipped_available and clipped_available())
++
+     def provide(self, pre_process=None, post_process=None, vp_stage=None):
+         """Build the text model (native Megatron GPT backbone, no wrapper)."""
+         # Recipe-less model building may skip finalize(); make sure the block
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/hyper_connection.py b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/hyper_connection.py
+index e969acb..39e04f7 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/hyper_connection.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/hyper_connection.py
+@@ -5,6 +5,7 @@
+ """Hyper-connection (mHC) module: mappings, Sinkhorn projection and stream merge."""
+ 
+ import math
++from functools import partial
+ from typing import Optional, Tuple
+ 
+ import torch
+@@ -226,18 +227,50 @@ class HyperConnectionModule(MegatronModule):
+         self.norm_eps = 1e-6
+ 
+         # Choose implementation: unified fused kernels vs reference modules.
++        # The fused public API selects the backend per operation internally.
++        # fused_add_3 always uses torch.compile (native_fused_add_3) regardless
++        # of the kernel backend. cuTile's register overhead (56 regs/thread for
++        # a trivial a+b+c) is not worth it for a pure memory-bound elementwise op.
+         self._fused_add_3_op = native_fused_add_3
++
++        # The fused path computes the projection and compute_h in one op, so
++        # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
++        # reached on the unfused path.
+         self._proj_rms_op = native_proj_rms
+ 
+-        # Ascend arm (`model.use_fused_mhc`, pushed by the provider):
+-        # `mhc_pre_sinkhorn` fuses projection + Sinkhorn + collapse (so
+-        # `compute_mappings` returns the collapsed stream and `aggregate` serves
+-        # it back) and `mhc_post` fuses the write-back.  With the switch off the
+-        # native ops are the reference chain.
+-        self._fused_mhc = mhc_fused.fused_enabled()
+-        self._sinkhorn_op = native_sinkhorn
+-        self._h_aggregate_op = native_h_aggregate
+-        self._h_post_bda_op = mhc_fused.fused_h_post_bda if self._fused_mhc else native_h_post_bda
++        if config.use_fused_mhc and not mhc_fused.fused_routable():
++            from megatron.core.fusions.fused_mhc_kernels import (
++                fused_h_aggregate,
++                fused_h_post_bda,
++                fused_proj_rms_compute_h,
++                fused_sinkhorn,
++                log_fused_mhc_backend_once,
++            )
++
++            backend = config.mhc_fused_backend
++            log_fused_mhc_backend_once(backend)
++            self._sinkhorn_op = partial(fused_sinkhorn, backend=backend)
++            self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
++            self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
++            self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
++        else:
++            self._sinkhorn_op = native_sinkhorn
++            self._h_aggregate_op = native_h_aggregate
++            self._h_post_bda_op = native_h_post_bda
++            self._proj_rms_compute_h_op = None
++
++        # Ascend arm: ``mhc_post`` fuses the write-back, and with
++        # ``use_fused_split_mhc_pre`` the pre step runs as ``mhc_pre`` +
++        # ``mhc_sinkhorn`` (then ``compute_mappings`` returns the collapsed
++        # stream and ``aggregate`` serves it back).  The eager ops stay
++        # installed as the per-call fallback, so a shape or a build the kernels
++        # reject keeps the reference path.  The install decision reads the
++        # switch and the operator availability only: the parameters still sit on
++        # CPU at construction time (the bridge moves the model to the NPU
++        # afterwards), so the device guard runs on the live tensors at call time.
++        self._ascend_fused_mhc = mhc_fused.fused_routable()
++        if self._ascend_fused_mhc:
++            self._h_post_bda_op = partial(mhc_fused.fused_h_post_bda, native=native_h_post_bda)
+         self._fused_collapsed_stream: Optional[Tensor] = None
+ 
+         self._init_weights()
+@@ -325,12 +358,13 @@ class HyperConnectionModule(MegatronModule):
+         s, b, _ = x.shape
+         self._fused_collapsed_stream = None
+ 
+-        if self._fused_mhc:
+-            # Ascend arm: one kernel does projection + Sinkhorn + stream collapse,
+-            # so the H_pre slot carries the already-collapsed stream and
+-            # `aggregate` hands it straight back (see `_fused_collapsed_stream`).
++        if self._ascend_fused_mhc and mhc_fused.split_enabled() and mhc_fused.can_use_fused(x):
++            # Split Ascend pre: two kernels do projection + norm + split and the
++            # Sinkhorn normalisation, and the collapse rides along -- so the
++            # H_pre slot carries the already-collapsed stream and ``aggregate``
++            # hands it straight back (see ``_fused_collapsed_stream``).
+             weight, scale, bias = self._fused_mhc_params()
+-            h_post, h_res, collapsed = mhc_fused.fused_pre_sinkhorn(
++            h_post, h_res, collapsed = mhc_fused.split_pre_sinkhorn(
+                 x.view(s, b, self.n, self.hidden_size),
+                 weight,
+                 scale,
+@@ -343,12 +377,31 @@ class HyperConnectionModule(MegatronModule):
+             self._fused_collapsed_stream = collapsed.to(x.dtype)
+             return self._fused_collapsed_stream, h_post.to(x.dtype), h_res.to(x.dtype)
+ 
+-        # Reference chain: projection + norm, mapping, then Sinkhorn.
+-        with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
+-            proj, r = self._projection_and_get_norm(x)
+-        with torch.cuda.nvtx.range("HyperConnection::compute_h"):
+-            h_pre, h_post, h_res = self._compute_h(proj, r)
+-        h_res = h_res.view(s, b, self.n, self.n)
++        if self._proj_rms_compute_h_op is not None:
++            # Fused path: proj_rms + compute_h in one kernel launch sequence
++            x_2d = x.reshape(s * b, self.n * self.hidden_size)
++            with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
++                h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
++                    x_2d,
++                    self.mapping_proj.weight,
++                    self.alpha_pre,
++                    self.alpha_post,
++                    self.alpha_res,
++                    self.bias,
++                    self.n,
++                    self.norm_eps,
++                    self.compute_h_eps,
++                )
++            h_pre = h_pre.view(s, b, self.n)
++            h_post = h_post.view(s, b, self.n)
++            h_res = h_res.view(s, b, self.n, self.n)
++        else:
++            # Native path: separate proj_rms + _compute_h
++            with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
++                proj, r = self._projection_and_get_norm(x)
++            with torch.cuda.nvtx.range("HyperConnection::compute_h"):
++                h_pre, h_post, h_res = self._compute_h(proj, r)
++            h_res = h_res.view(s, b, self.n, self.n)
+ 
+         h_res = self._sinkhorn_op(h_res, self.sinkhorn_iterations, self.sinkhorn_eps)  # [s, b, n, n]
+ 
+@@ -449,7 +502,7 @@ class HyperConnectionModule(MegatronModule):
+         """
+         s, b, _ = x.shape
+         C = self.hidden_size
+-        if self._fused_mhc and self._fused_collapsed_stream is not None:
++        if self._ascend_fused_mhc and self._fused_collapsed_stream is not None:
+             # The fused pre already collapsed the streams (H_pre was consumed
+             # inside the kernel); return what it produced.
+             return self._fused_collapsed_stream
+@@ -457,11 +510,11 @@ class HyperConnectionModule(MegatronModule):
+         return self._h_aggregate_op(x_streams, h_pre)
+ 
+     def _fused_mhc_params(self) -> Tuple[Tensor, Tensor, Tensor]:
+-        """Parameters the fused mHC ops take: (projection weight, scale[3], bias).
++        """Parameters the fused mHC operators take: (projection weight, scale[3], bias).
+ 
+-        The two DSv4 mHC classes spell these differently (``mapping_proj.weight`` +
+-        ``alpha_pre/post/res`` here, ``fn`` + ``scale`` + ``base`` in ``MHCModule``),
+-        so each class maps its own names onto the operator's contract.
++        The two DSv4 mHC classes spell these differently (``mapping_proj.weight``
++        + ``alpha_pre/post/res`` here, ``fn`` + ``scale`` + ``base`` in
++        ``MHCModule``), so each class maps its own names onto the contract.
+         """
+         return (
+             self.mapping_proj.weight,
+@@ -871,12 +924,16 @@ class MHCModule(HyperConnectionModule):
+         self._proj_rms_op = native_proj_rms_clamped
+         self._sinkhorn_op = native_sinkhorn
+         self._h_aggregate_op = native_h_aggregate
++        self._h_post_bda_op = native_h_post_bda
++        self._proj_rms_compute_h_op = None
+ 
+-        # Same Ascend arm as the parent: the fused pre/post ops replace the
+-        # natives when the provider-pushed switch is on.
+-        self._fused_mhc = mhc_fused.fused_enabled()
+-        self._h_post_bda_op = mhc_fused.fused_h_post_bda if self._fused_mhc else native_h_post_bda
++        # Same Ascend arm as the parent, and likewise device-independent here:
++        # ``self.fn`` is on CPU until the bridge moves the model, so the device
++        # guard runs on the live tensors at call time.
++        self._ascend_fused_mhc = mhc_fused.fused_routable()
+         self._fused_collapsed_stream: Optional[Tensor] = None
++        if self._ascend_fused_mhc:
++            self._h_post_bda_op = partial(mhc_fused.fused_h_post_bda, native=native_h_post_bda)
+ 
+         if self.config.perform_initialization:
+             nn.init.xavier_uniform_(self.fn)
+@@ -905,7 +962,7 @@ class MHCModule(HyperConnectionModule):
+         return h_pre, h_post, h_res
+ 
+     def _fused_mhc_params(self) -> Tuple[Tensor, Tensor, Tensor]:
+-        """Fused-op parameters from this class's packed layout (``fn``/``scale``/``base``)."""
++        """Fused-operator parameters from this class's packed layout (``fn``/``scale``/``base``)."""
+         return self.fn, self.scale.to(torch.float32), self.base
+ 
+ 
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fb_overlap.py b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fb_overlap.py
+new file mode 100644
+index 0000000..e75275c
+--- /dev/null
++++ b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fb_overlap.py
+@@ -0,0 +1,215 @@
++# Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0.
++"""DSv4 hyper connections (mHC) under MindSpeed's MoE forward/backward overlap.
++
++MindSpeed's staged layer forward supports hyper connections through a two-stage
++protocol it expects the layer to provide::
++
++    hidden, post, comb = layer.attn_mhc(hidden, mhc_stage='pre')
++    hidden             = layer.attn_mhc(hidden, mhc_stage='post',
++                                        residual=..., post=post, comb=comb)
++
++and the same for ``mlp_mhc``.  It detaches ``post`` / ``comb`` so the pre stage's
++graph can be run separately, and its backward already joins the three gradients
++(``overlap_funcs/bwd.py`` backprops the pre graph with
++``(pre.grad, post.grad, comb.grad)``), so nothing here has to carry gradients
++across the two phases by hand.
++
++DSv4 implements the same idea with different pieces, and this module maps one to
++the other:
++
++* **pre** is ``HyperConnectionModule.forward``, which returns
++  ``(aggregated, h_res, h_post)`` -- the aggregated single-stream input for the
++  norm, plus the residual-mixing and expansion maps.  ``post`` is ``h_post`` and
++  ``comb`` is ``h_res``; the residual is the n-stream input itself, which is
++  exactly what MindSpeed hands back as ``residual=``.
++* **post** is ``fused_h_res_h_post_bda``, which fuses ``apply_h_res``,
++  ``apply_h_post`` and the bias-dropout-add into one kernel.  Because that
++  kernel owns the residual add, MindSpeed's own intermediate BDA has to be taken
++  out of the way: its ``self_attn_bda`` / ``mlp_bda`` are replaced on the
++  instance by a pass-through that only folds in the bias.  Leaving the stock BDA
++  in place would also be a shape error -- it would add a single-stream branch
++  output ``[s, b, C]`` to the n-stream residual ``[s, b, n*C]``.
++
++At block level MindSpeed replaces ``TransformerBlock.forward``, which drops the
++two things DSv4's own block forward does around the layers: the entry expansion
++to the n-stream layout, and the learned contraction back to one stream before
++the final layernorm.  Both are reinstalled here -- the expansion by wrapping the
++staged forward, and the contraction by wrapping the final layernorm's own
++forward (not by replacing the module, which would rename its parameters).
++"""
++
++from __future__ import annotations
++
++from functools import wraps
++
++import torch
++
++from megatron.core.utils import make_viewless_tensor
++
++from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash.hyper_connection import (
++    learned_output_contract,
++)
++
++_INSTALLED_ATTR = "_dsv4_mhc_fb_overlap_installed"
++_NORM_CONTRACT_ATTR = "_dsv4_mhc_fb_overlap_norm_contract"
++
++
++def register_dsv4_mhc_fb_overlap_patch(patch_manager) -> None:
++    """Install the DSv4 mHC staging on top of MindSpeed's F/B overlap block.
++
++    Registered after MindSpeed's own ``TransformerBlock.__init__`` wrapper so
++    this one is the outer wrapper: the staged forward and the staged layer
++    forwards already exist by the time it runs.
++    """
++    patch_manager.register_patch(
++        "megatron.core.transformer.transformer_block.TransformerBlock.__init__",
++        dsv4_mhc_fb_overlap_block_init_wrapper,
++    )
++
++
++def dsv4_mhc_fb_overlap_block_init_wrapper(original):
++    """Adapt a freshly built block (and its layers) to the staged mHC protocol."""
++
++    @wraps(original)
++    def init_with_mhc_fb_overlap(self, *args, **kwargs):
++        original(self, *args, **kwargs)
++        if not getattr(self.config, "enable_mhc_connections", False):
++            return
++        install_fb_overlap_mhc_adapters(self)
++
++    return init_with_mhc_fb_overlap
++
++
++def install_fb_overlap_mhc_adapters(block) -> None:
++    """Give one block's layers the staged mHC interface (idempotent)."""
++    if getattr(block, _INSTALLED_ATTR, False):
++        return
++
++    for layer in getattr(block, "layers", None) or []:
++        _install_layer_mhc_stages(layer)
++
++    _install_block_envelope(block)
++    setattr(block, _INSTALLED_ATTR, True)
++
++
++def _install_layer_mhc_stages(layer) -> bool:
++    """Expose ``attn_mhc`` / ``mlp_mhc`` and defer the layer's BDA to them."""
++    attn_connection = getattr(layer, "self_attention_hyper_connection", None)
++    mlp_connection = getattr(layer, "mlp_hyper_connection", None)
++    if attn_connection is None or mlp_connection is None:
++        # A layer without hyper connections (a NoopTransformerLayer, say) keeps
++        # MindSpeed's plain path.
++        return False
++
++    layer.attn_mhc = _make_mhc_stage(layer, attn_connection)
++    layer.mlp_mhc = _make_mhc_stage(layer, mlp_connection)
++    # The fused mHC kernel in the post stage owns the residual add and the
++    # dropout, so the BDA MindSpeed runs in between must not do either.
++    layer.self_attn_bda = _passthrough_bda
++    layer.mlp_bda = _passthrough_bda
++    return True
++
++
++def _make_mhc_stage(layer, connection):
++    """Build the two-stage callable MindSpeed's staged forward expects."""
++
++    def mhc_stage(hidden_states, mhc_stage="pre", residual=None, post=None, comb=None):
++        if mhc_stage == "pre":
++            # mhc_recompute_manager is deliberately not threaded: under F/B
++            # overlap MindSpeed owns activation recompute at layer granularity,
++            # and the manager's checkpoints are driven by DSv4's own layer
++            # forward, which is no longer the one running.
++            aggregated, h_res, h_post = connection(hidden_states)
++            return aggregated, h_post, h_res
++        if mhc_stage == "post":
++            if residual is None or post is None or comb is None:
++                raise ValueError("dsv4 mHC post stage needs residual, post (h_post) and comb (h_res)")
++            with layer.bias_dropout_add_exec_handler():
++                return connection.fused_h_res_h_post_bda(
++                    comb,
++                    residual,
++                    post,
++                    (hidden_states, None),
++                    layer.hidden_dropout,
++                    layer.training,
++                    layer.config.bias_dropout_fusion,
++                    None,
++                )
++        raise ValueError(f"unknown mhc_stage {mhc_stage!r}, expected 'pre' or 'post'")
++
++    return mhc_stage
++
++
++def _passthrough_bda(training, bias_dropout_fusion):  # pylint: disable=unused-argument
++    """Stand in for the layer's BDA while the fused mHC kernel performs it.
++
++    Returns the branch output with its bias folded in and the residual
++    untouched; the residual add, the dropout and the stream mixing all happen in
++    ``fused_h_res_h_post_bda`` during the post stage.
++    """
++
++    def apply_passthrough(output_with_bias, residual, prob):  # pylint: disable=unused-argument
++        output, bias = output_with_bias if isinstance(output_with_bias, tuple) else (output_with_bias, None)
++        return output if bias is None else output + bias
++
++    return apply_passthrough
++
++
++def _install_block_envelope(block) -> None:
++    """Restore the entry expansion and the exit contraction around the staging."""
++    staged_forward = block.forward
++
++    @wraps(staged_forward)
++    def forward_with_mhc_envelope(*args, **kwargs):
++        # Installed on the first call, not at construction: the mHC block sets
++        # its head parameters *after* the base __init__ this wrapper came from.
++        _ensure_norm_contract(block)
++        args, kwargs = block._expand_mhc_inputs(args, kwargs)  # pylint: disable=protected-access
++        return staged_forward(*args, **kwargs)
++
++    block.forward = forward_with_mhc_envelope
++
++
++def _ensure_norm_contract(block) -> None:
++    """Contract n streams to one inside the final layernorm's own forward.
++
++    MindSpeed's staged block detaches the hidden states, records that tensor as
++    the entry point for the staged backward, and calls ``self.final_layernorm``
++    on it.  Wrapping the norm's forward keeps that bookkeeping -- and the norm's
++    parameter names -- exactly as they are, while still contracting before the
++    weight of width ``hidden_size`` is applied.
++    """
++    if getattr(block, _NORM_CONTRACT_ATTR, False):
++        return
++    setattr(block, _NORM_CONTRACT_ATTR, True)
++
++    norm = getattr(block, "final_layernorm", None)
++    if norm is None or not getattr(block, "_mhc_has_head", False):
++        return
++
++    original_forward = norm.forward
++    config = block.config
++
++    @wraps(original_forward)
++    def forward_with_contract(hidden_states, *args, **kwargs):
++        n = config.mhc_num_residual_streams
++        if hidden_states.dim() >= 2 and hidden_states.shape[-1] == n * config.hidden_size:
++            hidden_states = learned_output_contract(
++                hidden_states,
++                block.hc_head_fn,
++                block.hc_head_base,
++                block.hc_head_scale,
++                n,
++                config.layernorm_epsilon,
++            )
++        output = original_forward(hidden_states, *args, **kwargs)
++        if isinstance(output, torch.Tensor):
++            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
++        return output
++
++    norm.forward = forward_with_contract
++
++
++__all__ = ["install_fb_overlap_mhc_adapters", "register_dsv4_mhc_fb_overlap_patch"]
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fused.py b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fused.py
+index bedd606..bfa1e1a 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fused.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/mhc_fused.py
+@@ -3,31 +3,53 @@
+ # Licensed under the Apache License, Version 2.0.
+ """Ascend fused mHC operators for the DeepSeek-V4-Flash text stack.
+ 
+-``cann_ops_transformer.ops.mhc_pre_sinkhorn`` fuses the whole pre chain -- the
+-projection, the ``H_pre`` / ``H_post`` / ``H_res`` split, the Sinkhorn-Knopp
+-normalisation over the residual streams and the n-stream collapse -- and
+-``mhc_post`` fuses the write-back (``H_resᵀ @ residual + H_post ⊗ x``).  Both ops
+-ship their own backward wrappers (``mhc_pre_sinkhorn_backward`` /
+-``mhc_post_backward``), so no autograd bridge is needed here.
+-
+-Switch: ``model.use_fused_mhc`` (single writer: the provider).  The eager chain
+-in ``hyper_connection.py`` is the reference: with the switch off nothing here
+-runs; with it on the two calls below replace the pre/post chains.  DSv4 pins
+-``add_bias_linear=False``, so the write-back always takes the fused form.
++The mHC step around each sublayer is two halves.  The *pre* half projects the
++residual streams, RMS-norms the projection, splits it into the ``H_pre`` /
++``H_post`` / ``H_res`` gates, runs Sinkhorn-Knopp over ``H_res`` and collapses
++the n streams into the one the sublayer sees.  The *post* half writes the
++sublayer output back: ``H_resᵀ @ residual + H_post ⊗ x``.
++
++This module is the Ascend seam for both halves: the switch, the availability
++probe, the device guard and the bias gate.  The eager chain in
++``hyper_connection.py`` stays installed as the per-call fallback, so a shape or
++a build the kernels reject keeps the reference path.
++
++* pre:  ``cann_ops_transformer.ops.mhc_pre`` (projection + norm + split, which
++  also answers the un-normalised residual logits) followed by
++  ``ops.mhc_sinkhorn`` over those logits.  Opt-in, through
++  ``model.use_fused_split_mhc_pre``: it is the split form of the pre step, and
++  it is the only fused pre this module offers.
++* post: ``ops.mhc_post``, on with ``model.use_fused_mhc``.
++
++Both operators ship their own backward wrappers (``mhc_pre_backward`` /
++``mhc_sinkhorn_backward`` / ``mhc_post_backward``), so there is no autograd
++bridge here.
++
++``model.use_fused_mhc`` could not be used on Ascend before: its implementation
++imported ``megatron.core.fusions.fused_mhc_kernels``, which is CUDA/Blackwell
++only and absent from the pinned Megatron-LM, so the provider pinned the flag
++off.  With this module the same flag routes to the CANN operators instead, and
++``hyper_connection.py`` only reaches for the Blackwell kernels when this arm is
++not available.
+ """
+ 
+ from __future__ import annotations
+ 
++import logging
+ import time
+-from typing import Any, Optional, Tuple
++from typing import Any, Callable, Optional, Tuple
+ 
+ import torch
+ 
+-# Provider default today (the recipe pins False); the provider flips it in
+-# finalize()/provide() once every CLI override has landed.
++# Provider defaults; the provider flips them in finalize()/provide() once every
++# recipe assignment and CLI override has landed.  ``_SPLIT_ENABLED`` rides on
++# ``_FUSED_ENABLED``: it selects the fused pre, and the provider refuses it on
++# its own.
+ _FUSED_ENABLED = False
++_SPLIT_ENABLED = False
++# None = not probed yet, False = cann_ops_transformer lacks the mHC operators.
+ _OPS = None
+-_MISSING_OPS = "model.use_fused_mhc=true needs cann_ops_transformer with the mhc_pre_sinkhorn / mhc_post operators."
++_WARNED_MHC_POST_FALLBACK = False
+ 
+ 
+ def set_fused_enabled(flag: bool) -> None:
+@@ -41,13 +63,28 @@ def fused_enabled() -> bool:
+     return _FUSED_ENABLED
+ 
+ 
++def set_split_enabled(flag: bool) -> None:
++    """Set the split-pre gate (single writer: the DSv4 provider)."""
++    global _SPLIT_ENABLED
++    _SPLIT_ENABLED = bool(flag)
++
++
++def split_enabled() -> bool:
++    """Read at call time, like the other gate in this module."""
++    return _SPLIT_ENABLED
++
++
+ def _ops() -> Any:
+-    """Resolve ``cann_ops_transformer.ops`` once; lazy, so a CPU import stays clean.
++    """Resolve the CANN ops module once; ``None`` when this build ships no mHC ops.
++
++    Lazy on purpose: importing this module must stay free of the NPU stack (the
++    plugin scan imports every ``*_provider`` module in a CPU process too).
+ 
+     The first import on an 8-rank start triggers the CANN extensions' JIT build;
+-    a rank that lands while another rank still holds the compile lock sees a
+-    transient ``FileNotFoundError`` for the not-yet-written ``.so``, so that one
+-    error is retried briefly instead of taking the whole rank down.
++    a rank whose dlopen lands while another rank still holds the compile lock
++    sees a transient ``FileNotFoundError`` for the not-yet-written ``.so``.
++    Retry briefly for exactly that race, so a startup collision never silently
++    pins one rank to the eager arm.
+     """
+     global _OPS
+     if _OPS is None:
+@@ -56,17 +93,80 @@ def _ops() -> Any:
+                 from cann_ops_transformer import ops  # pylint: disable=import-outside-toplevel
+             except FileNotFoundError:
+                 time.sleep(5.0)
+-            except Exception as exc:  # pylint: disable=broad-except
+-                raise RuntimeError(_MISSING_OPS) from exc
++                continue
++            except Exception:  # pylint: disable=broad-except  # absent/unloadable build
++                _OPS = False
++                break
+             else:
+-                _OPS = ops
++                _OPS = False if missing_ops(ops) else ops
+                 break
+         else:
+-            raise RuntimeError(_MISSING_OPS)
+-    return _OPS
++            _OPS = False
++    return _OPS or None
++
++
++def missing_ops(ops: Any) -> list:
++    """Names of the operators the post half needs and this build does not provide."""
++    return [name for name in ("mhc_post",) if not hasattr(ops, name)]
++
++
++def missing_split_ops(ops: Any) -> list:
++    """Names of the split-pre operators this build does not provide.
++
++    They ship separately from ``mhc_post``, so a build can serve
++    ``use_fused_mhc`` and still have nothing for the split pre.
++    """
++    return [name for name in ("mhc_pre", "mhc_sinkhorn") if not hasattr(ops, name)]
+ 
+ 
+-def fused_pre_sinkhorn(
++def fused_available() -> bool:
++    """True when the switch may be used on this build (the post operator is present)."""
++    return _ops() is not None
++
++
++def split_available() -> bool:
++    """True when this build ships both standalone pre operators."""
++    ops = _ops()
++    return ops is not None and not missing_split_ops(ops)
++
++
++def can_use_fused(tensor: torch.Tensor) -> bool:
++    """Fused arm allowed for ``tensor``: switch on, NPU device, operators present.
++
++    Call this on a tensor that is already on its final device -- an activation,
++    or a parameter after the model has been moved.  In a constructor use
++    :func:`fused_routable`.
++    """
++    return _FUSED_ENABLED and tensor.device.type == "npu" and fused_available()
++
++
++def fused_routable() -> bool:
++    """True when the Ascend arm may be installed (switch + operators, no device check).
++
++    The mHC modules are constructed with their parameters still on CPU (the
++    bridge moves the model to the NPU afterwards), so the install decision in
++    ``hyper_connection.py`` cannot read the parameter device.  It installs the
++    arm on this predicate and the actual tensors are guarded at call time by
++    :func:`can_use_fused`; an off-NPU call keeps the eager chain.
++    """
++    return _FUSED_ENABLED and fused_available()
++
++
++def _require_ops() -> Any:
++    """Resolve the ops handle, raising when this build cannot serve the call.
++
++    Every call site is guarded by :func:`can_use_fused` (switch + device +
++    operators), so this raise only fires on a caller error.
++    """
++    ops = _ops()
++    if ops is None:
++        raise RuntimeError(
++            "The installed cann_ops_transformer does not provide the required mHC operator: mhc_post"
++        )
++    return ops
++
++
++def split_pre_sinkhorn(
+     hidden_streams: torch.Tensor,
+     projection_weight: torch.Tensor,
+     scale: torch.Tensor,
+@@ -76,23 +176,52 @@ def fused_pre_sinkhorn(
+     mhc_eps: float,
+     norm_eps: float,
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """One ``mhc_pre_sinkhorn`` call: returns ``(h_post, h_res, h_in)``.
++    """Fused pre step as two operators: returns ``(h_post, h_res, h_in)``.
++
++    ``mhc_pre`` does the projection, the RMS norm and the stream split, handing
++    back the collapsed stream, the post gate and the *un-normalised* residual
++    logits; ``mhc_sinkhorn`` then runs Sinkhorn-Knopp over those logits.  ``h_in``
++    is the collapsed single stream (``H_pre`` is consumed inside the operator),
++    which is what ``aggregate`` has to return on the fused path.  The operators
++    run on the BSND permutes and the outputs are permuted back to the
++    token-major layout.
+ 
+-    ``h_in`` is the collapsed single stream (``H_pre`` is consumed inside the op),
+-    which is what ``aggregate`` has to return on the fused path.  The op runs on
+-    BSND permutes; the outputs are permuted back to the token-major layout.
++    Note the signatures, which are easy to get wrong: ``mhc_pre`` takes the
++    epsilons as ``(normEps, hcEps)``, takes neither the stream count nor the
++    iteration count, and answers ``(h_in, h_post, h_res_logits)``;
++    ``mhc_sinkhorn(x, eps, iters)`` answers the normalised matrix.  ``h_post``
++    and ``h_res`` come back in fp32, which is what ``mhc_post`` demands of them.
+     """
++    if hidden_streams.ndim != 4:
++        raise ValueError(
++            f"The Ascend mHC operator expects [sequence, batch, streams, hidden], got {tuple(hidden_streams.shape)}."
++        )
++    if num_streams != 4:
++        # The kernels are written for the 4-stream layout this architecture
++        # declares (hc_mult 4); refuse anything else rather than guess.
++        raise ValueError(f"The split Ascend mHC pre arm only supports 4 residual streams, got {num_streams}.")
++    ops = _require_ops()
++    missing = missing_split_ops(ops)
++    if missing:
++        raise RuntimeError(
++            "model.use_fused_split_mhc_pre needs a cann_ops_transformer that provides "
++            + ", ".join(missing)
++            + "; this build does not ship them."
++        )
++
+     streams_bsnd = hidden_streams.permute(1, 0, 2, 3).contiguous()
+-    collapsed, post, residual = _ops().mhc_pre_sinkhorn(
++    collapsed, post, residual_logits = ops.mhc_pre(
+         streams_bsnd,
+         projection_weight.float(),
+         scale.float(),
+         bias.float(),
+-        num_streams,
+-        sinkhorn_iterations,
+-        mhc_eps,
+         norm_eps,
++        mhc_eps,
+     )[:3]
++    residual = ops.mhc_sinkhorn(residual_logits, mhc_eps, sinkhorn_iterations)
++    if isinstance(residual, (tuple, list)):
++        residual = residual[0]
++
+     batch, sequence = streams_bsnd.shape[:2]
+     collapsed = collapsed.view(batch, sequence, collapsed.shape[-1]).permute(1, 0, 2).contiguous()
+     post = post.view(batch, sequence, num_streams).permute(1, 0, 2).contiguous()
+@@ -100,48 +229,96 @@ def fused_pre_sinkhorn(
+     return post, residual, collapsed.to(hidden_streams.dtype)
+ 
+ 
+-def fused_h_post_bda(
+-    h_res: torch.Tensor,
+-    original_residual: torch.Tensor,
+-    h_post: torch.Tensor,
+-    x: torch.Tensor,
+-    bias: Optional[torch.Tensor] = None,
++def _fused_mhc_post(
++    residual_streams: torch.Tensor,
++    sublayer_output: torch.Tensor,
++    post: torch.Tensor,
++    residual_mapping: torch.Tensor,
+ ) -> torch.Tensor:
+-    """One ``mhc_post`` call: ``H_resᵀ @ residual + H_post ⊗ x``.
++    """One ``mhc_post`` call for ``H_res^T @ residual + H_post * x``.
+ 
+-    Same result as ``hyper_connection.native_h_post_bda`` for this model.  The
+-    op has no additive-bias variant, and DSv4 pins ``add_bias_linear=False``, so
+-    a bias here is a caller error rather than something to route around.
++    Args are token-major ``[s, b, ...]``: ``residual_streams`` [s,b,n,C] bf16,
++    ``sublayer_output`` [s,b,C] bf16, ``post`` [s,b,n] and ``residual_mapping``
++    [s,b,n,n].  ``post`` and the mapping arrive in the activation dtype
++    (``compute_mappings`` casts them down on the way out); the operator's
++    parameter check takes them as DT_FLOAT, so they are upcast here -- the
++    values are the ones the pre operator produced, so nothing is lost.
+     """
+-    if bias is not None:
+-        raise ValueError(
+-            "The Ascend mhc_post operator has no additive-bias variant, and DSv4 pins add_bias_linear=False."
+-        )
++    global _WARNED_MHC_POST_FALLBACK  # pylint: disable=global-statement
+ 
+-    residual_bsnd = original_residual.permute(1, 0, 2, 3).contiguous()
+-    output_bsd = x.permute(1, 0, 2).contiguous()
+-    post_bsn = h_post.float().permute(1, 0, 2).contiguous()
+-    mapping_bsnn = h_res.float().permute(1, 0, 2, 3).contiguous()
++    residual_bsnd = residual_streams.permute(1, 0, 2, 3).contiguous()
++    output_bsd = sublayer_output.permute(1, 0, 2).contiguous()
++    post_bsn = post.float().permute(1, 0, 2).contiguous()
++    mapping_bsnn = residual_mapping.float().permute(1, 0, 2, 3).contiguous()
+     batch, sequence, streams, hidden = residual_bsnd.shape
+     expected_shape = (batch, sequence, streams, hidden)
+ 
++    def normalize(candidate):
++        if isinstance(candidate, (tuple, list)):
++            candidates = [value for value in candidate if isinstance(value, torch.Tensor)]
++        else:
++            candidates = [candidate]
++        for value in candidates:
++            if not isinstance(value, torch.Tensor):
++                continue
++            if tuple(value.shape) == expected_shape:
++                return value
++            if tuple(value.shape) == (batch, sequence, streams * hidden):
++                return value.view(expected_shape)
++        return None
++
+     # Official aclnnMhcPost argument order is (x, hRes, hOut, hPost), i.e.
+-    # (residual streams, sinkhorn mapping, sublayer output, post gate); the
+-    # output layout depends on the wheel, so accept both documented spellings.
+-    fused = _ops().mhc_post(residual_bsnd, mapping_bsnn, output_bsd, post_bsn)
+-    if isinstance(fused, (tuple, list)):
+-        fused = next(value for value in fused if isinstance(value, torch.Tensor))
+-    if tuple(fused.shape) == (batch, sequence, streams * hidden):
+-        fused = fused.view(expected_shape)
+-    elif tuple(fused.shape) != expected_shape:
+-        raise RuntimeError(f"mhc_post returned {tuple(fused.shape)}; expected {expected_shape}.")
++    # (residual streams, sinkhorn mapping, sublayer output, post gate).  The
++    # shape check above still guards against a build that deviates from the
++    # documented interface, with an exact PyTorch fallback.
++    fused_output = normalize(_require_ops().mhc_post(residual_bsnd, mapping_bsnn, output_bsd, post_bsn))
++
++    if fused_output is None:
++        if not _WARNED_MHC_POST_FALLBACK:
++            logging.warning(
++                "cann_ops_transformer.mhc_post returned an incompatible layout; "
++                "falling back to the exact PyTorch mHC post merge."
++            )
++            _WARNED_MHC_POST_FALLBACK = True
++        mapping = residual_mapping.to(residual_streams.dtype).transpose(-1, -2).contiguous()
++        return torch.matmul(mapping, residual_streams.contiguous()) + post.to(
++            residual_streams.dtype
++        ).unsqueeze(-1) * sublayer_output.unsqueeze(-2)
+ 
+-    return fused.permute(1, 0, 2, 3).contiguous().to(x.dtype)
++    return fused_output.permute(1, 0, 2, 3).contiguous().to(sublayer_output.dtype)
++
++
++def fused_h_post_bda(
++    h_res: torch.Tensor,
++    original_residual: torch.Tensor,
++    h_post: torch.Tensor,
++    x: torch.Tensor,
++    bias: Optional[torch.Tensor] = None,
++    native: Optional[Callable] = None,
++) -> torch.Tensor:
++    """Fused post step with the exact eager fallback.
++
++    ``bias`` is the *additive* stream bias of the eager chain, which the fused
++    operator does not take, so that case keeps the eager path.  ``native`` is
++    the module's own ``native_h_post_bda``, passed in as
++    ``partial(..., native=...)`` to avoid a circular import.
++    """
++    if bias is not None or not can_use_fused(x) or native is None:
++        return native(h_res, original_residual, h_post, x, bias)
++    return _fused_mhc_post(original_residual, x, h_post, h_res)
+ 
+ 
+ __all__ = [
++    "can_use_fused",
++    "fused_available",
+     "fused_enabled",
+     "fused_h_post_bda",
+-    "fused_pre_sinkhorn",
++    "fused_routable",
++    "missing_ops",
++    "missing_split_ops",
+     "set_fused_enabled",
++    "set_split_enabled",
++    "split_available",
++    "split_enabled",
++    "split_pre_sinkhorn",
+ ]
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/router.py b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/router.py
+index e99aa5e..97fcf09 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/router.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash/modelling_deepseek_v4_flash/router.py
+@@ -15,6 +15,8 @@ model forward; only layers whose table was actually loaded route by table.
+ 
+ from __future__ import annotations
+ 
++import logging
++import os
+ import threading
+ 
+ import torch
+@@ -22,6 +24,8 @@ import torch.nn.functional as F
+ 
+ from megatron.core.transformer.moe.router import TopKRouter
+ 
++logger = logging.getLogger(__name__)
++
+ _tls = threading.local()
+ 
+ # None = auto-detect from the loaded tid2eid table; 0 = disabled; N = explicit.
+@@ -198,4 +202,58 @@ class Dsv4HashRouter(TopKRouter):
+         return routing_probs, routing_map
+ 
+ 
+-__all__ = ["Dsv4HashRouter", "stash_input_ids"]
++def install_expert_load_logging() -> bool:
++    """``DSV4_LOG_EXPERT_LOAD=1``: log the per-expert token counts of each routing.
++
++    A development probe, off unless the environment variable is set, because it
++    reads the counts back to the host (one more D2H sync per MoE layer) and
++    prints a line per layer.  It patches ``TopKRouter.forward`` rather than this
++    module's subclass on purpose: MindSpeed's F/B-overlap MoE layer constructs a
++    plain ``TopKRouter`` of its own instead of the spec's router slot, so the
++    subclass is not what runs in that configuration -- patching the base class
++    covers both.
++
++    It answers the one question a config dump cannot: whether the routing is
++    actually balanced.  ``moe_router_force_load_balancing`` replaces the logits
++    with random ones, which is balanced *in expectation* -- the counts show how
++    much multinomial spread is left per microbatch.
++    """
++    if os.environ.get("DSV4_LOG_EXPERT_LOAD", "") != "1":
++        return False
++    if getattr(TopKRouter.forward, "_dsv4_logs_expert_load", False):
++        return True
++
++    original = TopKRouter.forward
++
++    def forward_with_load_log(self, *args, **kwargs):
++        probs, routing_map = original(self, *args, **kwargs)
++        try:
++            # routing_map is [tokens, experts] (bool): per-expert token counts.
++            counts = routing_map.sum(dim=0).to(torch.float32)
++            total = counts.sum()
++            n = counts.numel()
++            mx, mn = counts.max().item(), counts.min().item()
++            mean = (total / n).item() if n else 0.0
++            std = counts.std(unbiased=False).item() if n > 1 else 0.0
++            logger.info(
++                "dsv4 expert load: layer=%s experts=%d tokens=%d  min=%.0f mean=%.1f max=%.0f "
++                "std=%.1f  max/mean=%.3f",
++                getattr(self, "layer_number", "?"),
++                n,
++                int(total.item()),
++                mn,
++                mean,
++                mx,
++                std,
++                (mx / mean) if mean else 0.0,
++            )
++        except Exception:  # pylint: disable=broad-except  # a probe must never break a run
++            logger.warning("dsv4 expert load: probe failed", exc_info=True)
++        return probs, routing_map
++
++    forward_with_load_log._dsv4_logs_expert_load = True
++    TopKRouter.forward = forward_with_load_log
++    return True
++
++
++__all__ = ["Dsv4HashRouter", "install_expert_load_logging", "stash_input_ids"]
+diff --git a/mindspeed_bridge/models/deepseek_v4_flash_vision/modelling_deepseek_v4_flash_vision/deepseek_v4_flash_vision_step.py b/mindspeed_bridge/models/deepseek_v4_flash_vision/modelling_deepseek_v4_flash_vision/deepseek_v4_flash_vision_step.py
+index ebd2c52..d0e9a44 100644
+--- a/mindspeed_bridge/models/deepseek_v4_flash_vision/modelling_deepseek_v4_flash_vision/deepseek_v4_flash_vision_step.py
++++ b/mindspeed_bridge/models/deepseek_v4_flash_vision/modelling_deepseek_v4_flash_vision/deepseek_v4_flash_vision_step.py
+@@ -26,6 +26,7 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
+ from megatron.bridge.training.vlm_step import get_batch_from_iterator
+ 
+ from mindspeed_bridge.models.deepseek_v4_flash.deepseek_v4_flash_step import _cp_shard
++from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash.router import stash_input_ids
+ 
+ 
+ def _images_from_visual_inputs(visual_inputs: Any, batch_size: int):
+@@ -160,6 +161,14 @@ def forward_step(
+         forward_args["images"] = images
+ 
+     with state.straggler_timer:
++        # The hash-routed MoE layers look the expert ids up in their static
++        # table by token id; stash the batch ids for the routers of this forward
++        # (see router.py), exactly as the text step does.  ``tokens`` is already
++        # CP-sharded above, which is the shard the routers see.  Without this the
++        # table layers find no ids and fall back to score routing -- silently,
++        # because that fallback is also the legitimate path for a checkpoint that
++        # ships no table.
++        stash_input_ids(tokens)
+         output_tensor = model(**forward_args)
+ 
+     loss_function = create_masked_next_token_loss_function(
