@@ -598,3 +598,6 @@ M=0 时跳过 aclnnGroupedMatmulV5（该算子在空 token + 非连续 view 下�
 **一句话总结**：真正"为快而打"的是 **vllm-ascend 0002（视觉塔融合算子）+ mindspeed-bridge 的 mHC 融合与 wgrad 选择**；真正"省而设计"的是 **verl 零拷贝布局还原 + processor 的 384 token 预算**；`moe_fb_overlap` 是最诱人的吞吐选项但有 checkpoint 兼容性代价。
 
 torch.use_deterministic_algorithms(True, warn_only=True)改成torch_npu.npu.set_dererministic_level(3)  batch invariant.py
+
+
+此前训练视觉模型的 forward 没有把 token ID 交给前三层 hash router；缺失时会静默退回普通 top-k。训练侧还缺少推理使用的图像路由偏置 bias_vl，图像专家的选择规则也未完全一致。修复后，训练侧传递原始 token ID、加载并保持 bias_vl 的精度，按推理规则选择图像专家，同时保留重复专家的权重累加行为。CPU 路由对照测试中，所覆盖的路由权重和梯度差为 0
